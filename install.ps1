@@ -1,7 +1,9 @@
 $ErrorActionPreference = "Stop"
 
 $AppName = "VideoCompressor"
-$InstallRoot = Join-Path $env:LOCALAPPDATA "Programs\$AppName"
+$LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData) }
+if (-not $LocalAppDataRoot) { $LocalAppDataRoot = Join-Path $env:USERPROFILE "AppData\Local" }
+$InstallRoot = Join-Path $LocalAppDataRoot "Programs\$AppName"
 $InstalledScript = Join-Path $InstallRoot "VideoCompressor.ps1"
 $TempScript = Join-Path $InstallRoot "VideoCompressor.ps1.download"
 $BackupScript = Join-Path $InstallRoot "VideoCompressor.ps1.backup"
@@ -26,16 +28,64 @@ function Get-PowerShellExe {
     return $powershell.Source
 }
 
+function ConvertTo-WindowsArgument {
+    param([AllowNull()][string]$Argument)
+
+    if ($null -eq $Argument) {
+        return '""'
+    }
+
+    if ($Argument.Length -eq 0) {
+        return '""'
+    }
+
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    $result = '"'
+    $backslashes = 0
+    foreach ($char in $Argument.ToCharArray()) {
+        if ($char -eq '\') {
+            $backslashes++
+        } elseif ($char -eq '"') {
+            $result += ('\' * (($backslashes * 2) + 1))
+            $result += '"'
+            $backslashes = 0
+        } else {
+            if ($backslashes -gt 0) {
+                $result += ('\' * $backslashes)
+                $backslashes = 0
+            }
+            $result += $char
+        }
+    }
+
+    if ($backslashes -gt 0) {
+        $result += ('\' * ($backslashes * 2))
+    }
+
+    $result += '"'
+    return $result
+}
+
+function ConvertTo-ProcessArgumentString {
+    param([string[]]$Arguments)
+
+    return ($Arguments | ForEach-Object { ConvertTo-WindowsArgument $_ }) -join " "
+}
+
 function Invoke-InstalledApp {
     $exe = Get-PowerShellExe
-    Write-InstallerStatus "Launching installed app..."
-    Start-Process -FilePath $exe -ArgumentList @(
+    $argumentList = ConvertTo-ProcessArgumentString -Arguments @(
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "`"$InstalledScript`""
+        $InstalledScript
     )
+    Write-InstallerStatus "Launching installed app..."
+    Start-Process -FilePath $exe -ArgumentList $argumentList
 }
 
 try {

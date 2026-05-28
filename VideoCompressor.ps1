@@ -9,7 +9,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ScriptPath = $PSCommandPath
-$LogFile = Join-Path $env:TEMP "VideoCompressor-debug.log"
+$TempRoot = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
+$LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData) }
+if (-not $LocalAppDataRoot) { $LocalAppDataRoot = Join-Path $env:USERPROFILE "AppData\Local" }
+$LogFile = Join-Path $TempRoot "VideoCompressor-debug.log"
 $ContextMenuKey = "HKCU\Software\Classes\*\shell\CompressVideo"
 $VideoContextMenuKey = "HKCU\Software\Classes\SystemFileAssociations\video\shell\CompressVideo"
 $ContextMenuSubKey = "Software\Classes\*\shell\CompressVideo"
@@ -27,6 +30,7 @@ $LegacyContextMenuSubKeys = @(
     "SystemFileAssociations\video\shell\EasyCompressSettings"
 )
 $script:ReadinessCache = $null
+$script:InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
 
 function Write-Log {
     param([string]$Message)
@@ -62,10 +66,73 @@ function Write-DebugEnvironment {
     Write-Log "PowerShell: $($PSVersionTable.PSVersion)"
     Write-Log "User: $env:USERNAME"
     Write-Log "User profile: $env:USERPROFILE"
-    Write-Log "LocalAppData: $env:LOCALAPPDATA"
-    Write-Log "Temp: $env:TEMP"
+    Write-Log "LocalAppData: $LocalAppDataRoot"
+    Write-Log "Temp: $TempRoot"
+    Write-Log "Current culture: $([System.Globalization.CultureInfo]::CurrentCulture.Name)"
+    Write-Log "Current UI culture: $([System.Globalization.CultureInfo]::CurrentUICulture.Name)"
     Write-Log "Is admin: $(Test-IsAdministrator)"
     Write-Log "Log file: $LogFile"
+}
+
+function Get-PowerShellExe {
+    $pwsh = Get-Command "pwsh.exe" -ErrorAction SilentlyContinue
+    if ($pwsh -and (Test-Path -LiteralPath $pwsh.Source)) {
+        return $pwsh.Source
+    }
+
+    $powershell = Get-Command "powershell.exe" -ErrorAction SilentlyContinue
+    if ($powershell -and (Test-Path -LiteralPath $powershell.Source)) {
+        return $powershell.Source
+    }
+
+    return "powershell.exe"
+}
+
+function ConvertTo-WindowsArgument {
+    param([AllowNull()][string]$Argument)
+
+    if ($null -eq $Argument) {
+        return '""'
+    }
+
+    if ($Argument.Length -eq 0) {
+        return '""'
+    }
+
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    $result = '"'
+    $backslashes = 0
+    foreach ($char in $Argument.ToCharArray()) {
+        if ($char -eq '\') {
+            $backslashes++
+        } elseif ($char -eq '"') {
+            $result += ('\' * (($backslashes * 2) + 1))
+            $result += '"'
+            $backslashes = 0
+        } else {
+            if ($backslashes -gt 0) {
+                $result += ('\' * $backslashes)
+                $backslashes = 0
+            }
+            $result += $char
+        }
+    }
+
+    if ($backslashes -gt 0) {
+        $result += ('\' * ($backslashes * 2))
+    }
+
+    $result += '"'
+    return $result
+}
+
+function ConvertTo-ProcessArgumentString {
+    param([string[]]$Arguments)
+
+    return ($Arguments | ForEach-Object { ConvertTo-WindowsArgument $_ }) -join " "
 }
 
 function Test-IsAdministrator {
@@ -77,9 +144,8 @@ function Test-IsAdministrator {
 function Start-Elevated {
     param([string[]]$Arguments)
 
-    $quotedScript = '"' + $ScriptPath + '"'
-    $argumentList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $quotedScript) + $Arguments
-    Start-Process -FilePath "powershell.exe" -ArgumentList $argumentList -Verb RunAs
+    $argumentList = ConvertTo-ProcessArgumentString -Arguments (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $ScriptPath) + $Arguments)
+    Start-Process -FilePath (Get-PowerShellExe) -ArgumentList $argumentList -Verb RunAs
     exit
 }
 
@@ -148,26 +214,29 @@ function Find-Executable {
 
     Write-Log "Finding executable: $Name"
     $command = Get-Command $Name -ErrorAction SilentlyContinue
-    if ($command -and (Test-Path -LiteralPath $command.Source)) {
-        Write-Log "Found via PATH: $($command.Source)"
-        return $command.Source
+    if ($command -and $command.Source -and (Test-Path -LiteralPath $command.Source)) {
+        $sourcePath = [System.IO.Path]::GetFullPath($command.Source)
+        Write-Log "Found via PATH: $sourcePath"
+        return $sourcePath
     }
 
     $directCandidates = @(
-        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\$Name",
+        "$LocalAppDataRoot\Microsoft\WinGet\Links\$Name",
         "$env:ProgramFiles\ffmpeg\bin\$Name",
         "${env:ProgramFiles(x86)}\ffmpeg\bin\$Name",
-        "$env:LOCALAPPDATA\Programs\ffmpeg\bin\$Name"
+        "$LocalAppDataRoot\Programs\ffmpeg\bin\$Name",
+        "$LocalAppDataRoot\Programs\FFmpeg\bin\$Name"
     ) | Where-Object { $_ }
 
     foreach ($candidate in $directCandidates) {
         if (Test-Path -LiteralPath $candidate) {
-            Write-Log "Found direct candidate: $candidate"
-            return $candidate
+            $candidatePath = [System.IO.Path]::GetFullPath($candidate)
+            Write-Log "Found direct candidate: $candidatePath"
+            return $candidatePath
         }
     }
 
-    $wingetPackages = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
+    $wingetPackages = "$LocalAppDataRoot\Microsoft\WinGet\Packages"
     if (Test-Path -LiteralPath $wingetPackages) {
         $packageRoots = Get-ChildItem -LiteralPath $wingetPackages -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match "FFmpeg|Gyan" }
@@ -182,8 +251,9 @@ function Find-Executable {
             foreach ($pattern in $knownMatches) {
                 $match = Get-Item -Path $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($match -and (Test-Path -LiteralPath $match.FullName)) {
-                    Write-Log "Found WinGet package candidate: $($match.FullName)"
-                    return $match.FullName
+                    $matchPath = [System.IO.Path]::GetFullPath($match.FullName)
+                    Write-Log "Found WinGet package candidate: $matchPath"
+                    return $matchPath
                 }
             }
         }
@@ -530,7 +600,18 @@ function Get-VideoDuration {
             return 0
         }
 
-        return [math]::Round([double]$durationRaw)
+        $durationValue = 0.0
+        $durationText = ([string]$durationRaw).Trim()
+        if ([double]::TryParse($durationText, [System.Globalization.NumberStyles]::Float, $script:InvariantCulture, [ref]$durationValue)) {
+            return [math]::Round($durationValue)
+        }
+
+        if ([double]::TryParse($durationText, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::CurrentCulture, [ref]$durationValue)) {
+            return [math]::Round($durationValue)
+        }
+
+        Write-Log "Could not parse duration: $durationText"
+        return 0
     } catch {
         Write-Log "Error getting duration: $($_.Exception.Message)"
         return 0
@@ -542,20 +623,6 @@ function Format-Seconds {
 
     $time = [TimeSpan]::FromSeconds($Seconds)
     return "{0:D2}:{1:D2}:{2:D2}" -f ([int]$time.TotalHours), $time.Minutes, $time.Seconds
-}
-
-function ConvertTo-ProcessArgumentString {
-    param([string[]]$Arguments)
-
-    return ($Arguments | ForEach-Object {
-        if ($null -eq $_) {
-            '""'
-        } elseif ($_ -match '[\s"]') {
-            '"' + ($_.Replace('"', '\"')) + '"'
-        } else {
-            $_
-        }
-    }) -join " "
 }
 
 function Install-EasyCompressFromTui {
@@ -671,6 +738,7 @@ function Show-CompressorUi {
     }
 
     $inputItem = Get-Item -LiteralPath $Path
+    $Path = $inputItem.FullName
     Write-Log "Input full name: $($inputItem.FullName)"
     Write-Log "Input size: $($inputItem.Length)"
 
@@ -1159,8 +1227,8 @@ function Show-CompressorUi {
         $basePath = [System.IO.Path]::ChangeExtension($Path, $null)
         $outputFile = "${basePath}_$suffix.mp4"
         $runId = [Guid]::NewGuid().ToString("N")
-        $ffmpegStdOut = Join-Path $env:TEMP "EasyCompress-ffmpeg-$runId.out.log"
-        $ffmpegStdErr = Join-Path $env:TEMP "EasyCompress-ffmpeg-$runId.err.log"
+        $ffmpegStdOut = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId.out.log"
+        $ffmpegStdErr = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId.err.log"
 
         $compressBtn.Enabled = $false
         $cmbResolution.Enabled = $false
