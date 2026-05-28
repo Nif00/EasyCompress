@@ -34,6 +34,40 @@ function Write-Log {
     "[$timestamp] $Message" | Out-File -FilePath $LogFile -Append -Encoding utf8
 }
 
+function Write-LogFileTail {
+    param(
+        [string]$Path,
+        [string]$Label,
+        [int]$Lines = 80
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Log "$Label missing: $Path"
+        return
+    }
+
+    Write-Log "$Label path: $Path"
+    Write-Log "$Label tail:"
+    try {
+        Get-Content -LiteralPath $Path -Tail $Lines -ErrorAction Stop | ForEach-Object {
+            Write-Log "  $_"
+        }
+    } catch {
+        Write-Log "$Label read failed: $($_.Exception.Message)"
+    }
+}
+
+function Write-DebugEnvironment {
+    Write-Log "Script path: $ScriptPath"
+    Write-Log "PowerShell: $($PSVersionTable.PSVersion)"
+    Write-Log "User: $env:USERNAME"
+    Write-Log "User profile: $env:USERPROFILE"
+    Write-Log "LocalAppData: $env:LOCALAPPDATA"
+    Write-Log "Temp: $env:TEMP"
+    Write-Log "Is admin: $(Test-IsAdministrator)"
+    Write-Log "Log file: $LogFile"
+}
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -79,7 +113,10 @@ function Test-ExecutableInPath {
 function Add-DirectoryToUserPath {
     param([string]$Directory)
 
+    Write-Log "Add-DirectoryToUserPath requested: $Directory"
+
     if (-not $Directory -or -not (Test-Path -LiteralPath $Directory)) {
+        Write-Log "PATH add skipped because directory is missing."
         return
     }
 
@@ -97,6 +134,9 @@ function Add-DirectoryToUserPath {
     if (-not $alreadyPresent) {
         $newPath = (@($pathParts) + $Directory) -join ";"
         [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+        Write-Log "Added directory to user PATH."
+    } else {
+        Write-Log "Directory already present in user PATH."
     }
 
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -106,8 +146,10 @@ function Add-DirectoryToUserPath {
 function Find-Executable {
     param([string]$Name)
 
+    Write-Log "Finding executable: $Name"
     $command = Get-Command $Name -ErrorAction SilentlyContinue
     if ($command -and (Test-Path -LiteralPath $command.Source)) {
+        Write-Log "Found via PATH: $($command.Source)"
         return $command.Source
     }
 
@@ -120,6 +162,7 @@ function Find-Executable {
 
     foreach ($candidate in $directCandidates) {
         if (Test-Path -LiteralPath $candidate) {
+            Write-Log "Found direct candidate: $candidate"
             return $candidate
         }
     }
@@ -139,22 +182,27 @@ function Find-Executable {
             foreach ($pattern in $knownMatches) {
                 $match = Get-Item -Path $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($match -and (Test-Path -LiteralPath $match.FullName)) {
+                    Write-Log "Found WinGet package candidate: $($match.FullName)"
                     return $match.FullName
                 }
             }
         }
     }
 
+    Write-Log "Executable not found: $Name"
     return $null
 }
 
 function Ensure-FFmpeg {
     Add-Type -AssemblyName System.Windows.Forms
 
+    Write-Log "Ensuring FFmpeg availability."
     $ffmpeg = Find-Executable "ffmpeg.exe"
     $ffprobe = Find-Executable "ffprobe.exe"
 
     if ($ffmpeg -and $ffprobe) {
+        Write-Log "FFmpeg ready: $ffmpeg"
+        Write-Log "FFprobe ready: $ffprobe"
         Add-DirectoryToUserPath -Directory (Split-Path -Parent $ffmpeg)
         return @{
             FFmpeg = $ffmpeg
@@ -170,6 +218,7 @@ function Ensure-FFmpeg {
     )
 
     if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+        Write-Log "User declined FFmpeg install."
         throw "FFmpeg is required to compress videos."
     }
 
@@ -178,9 +227,12 @@ function Ensure-FFmpeg {
     $ffmpeg = Find-Executable "ffmpeg.exe"
     $ffprobe = Find-Executable "ffprobe.exe"
     if (-not $ffmpeg -or -not $ffprobe) {
+        Write-Log "FFmpeg install completed but executables were not found. ffmpeg='$ffmpeg' ffprobe='$ffprobe'"
         throw "FFmpeg installation finished, but ffmpeg.exe or ffprobe.exe could not be found. Restart PowerShell or install FFmpeg manually."
     }
 
+    Write-Log "FFmpeg installed/found after install: $ffmpeg"
+    Write-Log "FFprobe installed/found after install: $ffprobe"
     Add-DirectoryToUserPath -Directory (Split-Path -Parent $ffmpeg)
     return @{
         FFmpeg = $ffmpeg
@@ -603,16 +655,24 @@ function Show-CompressorUi {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
+    Write-DebugEnvironment
+    Write-Log "Show-CompressorUi path: $Path"
 
     if (-not $Path) {
+        Write-Log "No input file provided."
         [System.Windows.Forms.MessageBox]::Show("No input file provided.", "Error", "OK", "Error") | Out-Null
         return
     }
 
     if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Log "Input file not found: $Path"
         [System.Windows.Forms.MessageBox]::Show("Input file not found: $Path", "Error", "OK", "Error") | Out-Null
         return
     }
+
+    $inputItem = Get-Item -LiteralPath $Path
+    Write-Log "Input full name: $($inputItem.FullName)"
+    Write-Log "Input size: $($inputItem.Length)"
 
     $tools = Ensure-FFmpeg
     $uiState = @{
@@ -1098,6 +1158,9 @@ function Show-CompressorUi {
 
         $basePath = [System.IO.Path]::ChangeExtension($Path, $null)
         $outputFile = "${basePath}_$suffix.mp4"
+        $runId = [Guid]::NewGuid().ToString("N")
+        $ffmpegStdOut = Join-Path $env:TEMP "EasyCompress-ffmpeg-$runId.out.log"
+        $ffmpegStdErr = Join-Path $env:TEMP "EasyCompress-ffmpeg-$runId.err.log"
 
         $compressBtn.Enabled = $false
         $cmbResolution.Enabled = $false
@@ -1120,24 +1183,42 @@ function Show-CompressorUi {
 
         $ffmpegArgs += @("-c:v", "libx264", "-crf", $crf, "-preset", "slower", "-c:a", "aac", "-b:a", "128k", $outputFile)
         $ffmpegArgumentString = ConvertTo-ProcessArgumentString -Arguments $ffmpegArgs
+        Write-Log "Selected resolution: $($selectedRes.Name)"
+        Write-Log "Selected scale: $scale"
+        Write-Log "Selected compression: $($selectedLevel.Name)"
+        Write-Log "Selected CRF: $crf"
+        Write-Log "Trim enabled: $($chkTrim.Checked)"
+        if ($chkTrim.Checked) {
+            Write-Log "Trim start seconds: $($trackStart.Value)"
+            Write-Log "Trim end seconds: $($trackEnd.Value)"
+        }
+        Write-Log "Output file: $outputFile"
+        Write-Log "FFmpeg stdout: $ffmpegStdOut"
+        Write-Log "FFmpeg stderr: $ffmpegStdErr"
         Write-Log "Running FFmpeg: $($tools.FFmpeg) $ffmpegArgumentString"
 
         try {
-            $process = Start-Process -FilePath $tools.FFmpeg -ArgumentList $ffmpegArgumentString -PassThru -WindowStyle Hidden
+            $process = Start-Process -FilePath $tools.FFmpeg -ArgumentList $ffmpegArgumentString -PassThru -WindowStyle Hidden -RedirectStandardOutput $ffmpegStdOut -RedirectStandardError $ffmpegStdErr
+            Write-Log "FFmpeg process started. Id: $($process.Id)"
             while (-not $process.HasExited) {
                 [System.Windows.Forms.Application]::DoEvents()
                 Start-Sleep -Milliseconds 200
             }
+
+            Write-Log "FFmpeg process exited. ExitCode: $($process.ExitCode)"
+            Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
+            Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
 
             if ($process.ExitCode -eq 0) {
                 $originalFile = Get-Item -LiteralPath $Path
                 $newFile = Get-Item -LiteralPath $outputFile
                 $newFile.CreationTime = $originalFile.CreationTime
                 $newFile.LastWriteTime = $originalFile.LastWriteTime
+                Write-Log "Compression succeeded. Output size: $($newFile.Length)"
                 $form.Close()
             } else {
                 $statusLabel.Text = "Error occurred."
-                [System.Windows.Forms.MessageBox]::Show("FFmpeg failed with exit code $($process.ExitCode)", "Error", "OK", "Error") | Out-Null
+                [System.Windows.Forms.MessageBox]::Show("FFmpeg failed with exit code $($process.ExitCode).`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
                 $compressBtn.Enabled = $true
                 $cmbResolution.Enabled = $true
                 $cmbCompression.Enabled = $true
@@ -1146,8 +1227,11 @@ function Show-CompressorUi {
                 $progressBar.Visible = $false
             }
         } catch {
+            Write-Log "FFmpeg launch/compression exception: $($_.Exception.Message)"
+            Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
+            Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
             $statusLabel.Text = "Error: $($_.Exception.Message)"
-            [System.Windows.Forms.MessageBox]::Show("An error occurred: $($_.Exception.Message)", "Error", "OK", "Error") | Out-Null
+            [System.Windows.Forms.MessageBox]::Show("An error occurred: $($_.Exception.Message)`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
             $compressBtn.Enabled = $true
             $cmbResolution.Enabled = $true
             $cmbCompression.Enabled = $true
