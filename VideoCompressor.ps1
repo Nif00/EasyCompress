@@ -4,7 +4,8 @@ param(
 
     [switch]$Register,
     [switch]$Unregister,
-    [switch]$InstallFFmpeg
+    [switch]$InstallFFmpeg,
+    [switch]$Update
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +13,14 @@ $ScriptPath = $PSCommandPath
 $TempRoot = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
 $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData) }
 if (-not $LocalAppDataRoot) { $LocalAppDataRoot = Join-Path $env:USERPROFILE "AppData\Local" }
+$AppName = "VideoCompressor"
+$InstallRoot = Join-Path $LocalAppDataRoot "Programs\$AppName"
+$InstalledScript = Join-Path $InstallRoot "VideoCompressor.ps1"
+$ScriptUrl = "https://raw.githubusercontent.com/Nif00/EasyCompress/main/VideoCompressor.ps1"
+$NoCacheHeaders = @{
+    "Cache-Control" = "no-cache, no-store, must-revalidate"
+    "Pragma" = "no-cache"
+}
 $LogFile = Join-Path $TempRoot "VideoCompressor-debug.log"
 $ContextMenuKey = "HKCU\Software\Classes\*\shell\CompressVideo"
 $VideoContextMenuKey = "HKCU\Software\Classes\SystemFileAssociations\video\shell\CompressVideo"
@@ -276,6 +285,9 @@ function Ensure-AdminForSetup {
     }
     if ($InstallFFmpeg) {
         $arguments += "-InstallFFmpeg"
+    }
+    if ($Update) {
+        $arguments += "-Update"
     }
 
     Start-Elevated -Arguments $arguments
@@ -550,6 +562,90 @@ function Unregister-ContextMenu {
     }
 }
 
+function Test-DownloadedScript {
+    param([string]$Path)
+
+    $downloaded = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($downloaded.Length -lt 10000) {
+        throw "Downloaded script is unexpectedly small."
+    }
+
+    $head = Get-Content -LiteralPath $Path -TotalCount 30 -ErrorAction Stop
+    if (($head -join "`n") -notmatch "VideoCompressor") {
+        throw "Downloaded file does not look like VideoCompressor.ps1."
+    }
+
+    $tokens = $null
+    $errors = $null
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $null = [System.Management.Automation.Language.Parser]::ParseFile($resolvedPath, [ref]$tokens, [ref]$errors)
+    if ($errors -and $errors.Count -gt 0) {
+        throw "Downloaded script has PowerShell parse errors."
+    }
+}
+
+function Start-UpdatedScript {
+    param([string]$Path)
+
+    $powerShellExe = Get-PowerShellExe
+    $argumentList = ConvertTo-ProcessArgumentString -Arguments @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $Path
+    )
+    Start-Process -FilePath $powerShellExe -ArgumentList $argumentList
+}
+
+function Update-EasyCompressFromGithub {
+    if (-not (Test-Path -LiteralPath $InstallRoot)) {
+        New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+    }
+
+    $targetScript = if (Test-Path -LiteralPath $InstalledScript) { $InstalledScript } else { Join-Path $InstallRoot "VideoCompressor.ps1" }
+    $tempScript = Join-Path $InstallRoot "VideoCompressor.ps1.download"
+    $backupScript = Join-Path $InstallRoot "VideoCompressor.ps1.backup"
+    $backupMade = $false
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $cacheBuster = [DateTime]::UtcNow.Ticks
+        $downloadUrl = "$ScriptUrl`?v=$cacheBuster"
+
+        Write-Host "Downloading latest EasyCompress..." -ForegroundColor Cyan
+        Write-Log "Updating EasyCompress from $downloadUrl"
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempScript -UseBasicParsing -Headers $NoCacheHeaders
+        Test-DownloadedScript -Path $tempScript
+
+        if (Test-Path -LiteralPath $targetScript) {
+            Copy-Item -LiteralPath $targetScript -Destination $backupScript -Force
+            $backupMade = $true
+        }
+
+        Move-Item -LiteralPath $tempScript -Destination $targetScript -Force
+        $hash = (Get-FileHash -LiteralPath $targetScript -Algorithm SHA256).Hash.Substring(0, 12)
+        Write-Log "Updated EasyCompress at $targetScript. Hash: $hash"
+        Write-Host "Updated EasyCompress." -ForegroundColor Green
+        Write-Host "Script hash: $hash"
+        Write-Host "Restarting updated setup menu..."
+        Start-UpdatedScript -Path $targetScript
+        exit
+    } catch {
+        Write-Log "Update failed: $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $tempScript) {
+            Remove-Item -LiteralPath $tempScript -Force -ErrorAction SilentlyContinue
+        }
+
+        if ($backupMade -and (Test-Path -LiteralPath $backupScript)) {
+            Copy-Item -LiteralPath $backupScript -Destination $targetScript -Force
+            Write-Log "Restored backup after failed update."
+        }
+
+        throw "Update failed: $($_.Exception.Message)"
+    }
+}
+
 function Test-ContextMenuRegistered {
     $compressKey = $null
     $settingsKey = $null
@@ -792,7 +888,8 @@ function Show-SetupTui {
         Write-Host "  3. Register Explorer context menu"
         Write-Host "  4. Unregister Explorer context menu"
         Write-Host "  5. Remove old admin/HKCR entries"
-        Write-Host "  6. Refresh checks"
+        Write-Host "  6. Update EasyCompress"
+        Write-Host "  7. Refresh checks"
         Write-Host "  0. Exit"
         Write-Host ""
 
@@ -834,7 +931,16 @@ function Show-SetupTui {
                 $forceRefresh = $true
                 Read-Host "Press Enter to continue"
             }
-            "6" { $forceRefresh = $true }
+            "6" {
+                try {
+                    Update-EasyCompressFromGithub
+                } catch {
+                    Write-Host $_.Exception.Message -ForegroundColor Red
+                    Read-Host "Press Enter to continue"
+                }
+                $forceRefresh = $true
+            }
+            "7" { $forceRefresh = $true }
             "0" { return }
             default {
                 Write-Host "Unknown option." -ForegroundColor Yellow
@@ -1442,7 +1548,7 @@ function Show-CompressorUi {
 try {
     Write-Log "--- Script started ---"
 
-    if (-not $InputFile) {
+    if (-not $InputFile -and -not $Update) {
         Ensure-AdminForSetup
     }
 
@@ -1454,6 +1560,11 @@ try {
             Add-DirectoryToUserPath -Directory (Split-Path -Parent $ffmpeg)
         }
         [System.Windows.Forms.MessageBox]::Show("FFmpeg installed and added to your user PATH.", "Video Compressor", "OK", "Information") | Out-Null
+        exit
+    }
+
+    if ($Update) {
+        Update-EasyCompressFromGithub
         exit
     }
 

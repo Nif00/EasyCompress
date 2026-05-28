@@ -18,6 +18,8 @@ The installer downloads the app to:
 
 It then opens the setup menu. Choose `1. Install` to install FFmpeg if needed and add the Explorer context menu.
 
+To update later, open **EasyCompress Settings** and choose `6. Update EasyCompress`.
+
 ## Uninstall
 
 Open the setup menu from the right-click **EasyCompress Settings** entry, then choose uninstall.
