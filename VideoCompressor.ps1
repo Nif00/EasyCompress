@@ -107,7 +107,7 @@ function Find-Executable {
     param([string]$Name)
 
     $command = Get-Command $Name -ErrorAction SilentlyContinue
-    if ($command) {
+    if ($command -and (Test-Path -LiteralPath $command.Source)) {
         return $command.Source
     }
 
@@ -138,7 +138,7 @@ function Find-Executable {
 
             foreach ($pattern in $knownMatches) {
                 $match = Get-Item -Path $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($match) {
+                if ($match -and (Test-Path -LiteralPath $match.FullName)) {
                     return $match.FullName
                 }
             }
@@ -490,6 +490,20 @@ function Format-Seconds {
 
     $time = [TimeSpan]::FromSeconds($Seconds)
     return "{0:D2}:{1:D2}:{2:D2}" -f ([int]$time.TotalHours), $time.Minutes, $time.Seconds
+}
+
+function ConvertTo-ProcessArgumentString {
+    param([string[]]$Arguments)
+
+    return ($Arguments | ForEach-Object {
+        if ($null -eq $_) {
+            '""'
+        } elseif ($_ -match '[\s"]') {
+            '"' + ($_.Replace('"', '\"')) + '"'
+        } else {
+            $_
+        }
+    }) -join " "
 }
 
 function Install-EasyCompressFromTui {
@@ -1105,10 +1119,11 @@ function Show-CompressorUi {
         }
 
         $ffmpegArgs += @("-c:v", "libx264", "-crf", $crf, "-preset", "slower", "-c:a", "aac", "-b:a", "128k", $outputFile)
-        Write-Log "Running FFmpeg: $($tools.FFmpeg) $($ffmpegArgs -join ' ')"
+        $ffmpegArgumentString = ConvertTo-ProcessArgumentString -Arguments $ffmpegArgs
+        Write-Log "Running FFmpeg: $($tools.FFmpeg) $ffmpegArgumentString"
 
         try {
-            $process = Start-Process -FilePath $tools.FFmpeg -ArgumentList $ffmpegArgs -PassThru -WindowStyle Hidden
+            $process = Start-Process -FilePath $tools.FFmpeg -ArgumentList $ffmpegArgumentString -PassThru -WindowStyle Hidden
             while (-not $process.HasExited) {
                 [System.Windows.Forms.Application]::DoEvents()
                 Start-Sleep -Milliseconds 200
