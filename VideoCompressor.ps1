@@ -135,6 +135,82 @@ function ConvertTo-ProcessArgumentString {
     return ($Arguments | ForEach-Object { ConvertTo-WindowsArgument $_ }) -join " "
 }
 
+function Invoke-LoggedProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$StdOutPath,
+        [Parameter(Mandatory = $true)][string]$StdErrPath
+    )
+
+    $argumentString = ConvertTo-ProcessArgumentString -Arguments $Arguments
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $stdoutWriter = $null
+    $stderrWriter = $null
+    $process = $null
+
+    try {
+        $stdoutWriter = [System.IO.StreamWriter]::new($StdOutPath, $false, $encoding)
+        $stderrWriter = [System.IO.StreamWriter]::new($StdErrPath, $false, $encoding)
+
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $FilePath
+        $startInfo.Arguments = $argumentString
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        $process.add_OutputDataReceived({
+            param($sender, $eventArgs)
+            if ($null -ne $eventArgs.Data) {
+                $stdoutWriter.WriteLine($eventArgs.Data)
+                $stdoutWriter.Flush()
+            }
+        })
+        $process.add_ErrorDataReceived({
+            param($sender, $eventArgs)
+            if ($null -ne $eventArgs.Data) {
+                $stderrWriter.WriteLine($eventArgs.Data)
+                $stderrWriter.Flush()
+            }
+        })
+
+        if (-not $process.Start()) {
+            throw "The process did not start."
+        }
+
+        $process.BeginOutputReadLine()
+        $process.BeginErrorReadLine()
+
+        while (-not $process.WaitForExit(200)) {
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+
+        $process.WaitForExit()
+        $stdoutWriter.Flush()
+        $stderrWriter.Flush()
+
+        return [pscustomobject]@{
+            Id = $process.Id
+            ExitCode = [int]$process.ExitCode
+            Arguments = $argumentString
+        }
+    } finally {
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+        if ($null -ne $stdoutWriter) {
+            $stdoutWriter.Dispose()
+        }
+        if ($null -ne $stderrWriter) {
+            $stderrWriter.Dispose()
+        }
+    }
+}
+
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -1283,16 +1359,9 @@ function Show-CompressorUi {
         Write-Log "Running FFmpeg: $($tools.FFmpeg) $ffmpegArgumentString"
 
         try {
-            $process = Start-Process -FilePath $tools.FFmpeg -ArgumentList $ffmpegArgumentString -PassThru -WindowStyle Hidden -RedirectStandardOutput $ffmpegStdOut -RedirectStandardError $ffmpegStdErr
-            Write-Log "FFmpeg process started. Id: $($process.Id)"
-            while (-not $process.HasExited) {
-                [System.Windows.Forms.Application]::DoEvents()
-                Start-Sleep -Milliseconds 200
-            }
-
-            $process.WaitForExit()
-            $process.Refresh()
-            $exitCode = $process.ExitCode
+            $processResult = Invoke-LoggedProcess -FilePath $tools.FFmpeg -Arguments $ffmpegArgs -StdOutPath $ffmpegStdOut -StdErrPath $ffmpegStdErr
+            Write-Log "FFmpeg process id: $($processResult.Id)"
+            $exitCode = $processResult.ExitCode
             Write-Log "FFmpeg process exited. ExitCode: $exitCode"
             Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
             Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
