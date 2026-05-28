@@ -5,7 +5,7 @@ $InstallRoot = Join-Path $env:LOCALAPPDATA "Programs\$AppName"
 $InstalledScript = Join-Path $InstallRoot "VideoCompressor.ps1"
 $TempScript = Join-Path $InstallRoot "VideoCompressor.ps1.download"
 $BackupScript = Join-Path $InstallRoot "VideoCompressor.ps1.backup"
-$ScriptUrl = "https://raw.githubusercontent.com/Nif00/CompressedAndShipped/main/VideoCompressor.ps1"
+$ScriptUrl = "https://raw.githubusercontent.com/Nif00/EasyCompress/main/VideoCompressor.ps1"
 
 function Write-InstallerStatus {
     param([string]$Message)
