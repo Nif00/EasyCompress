@@ -5,6 +5,7 @@ A single-file Windows context menu tool for compressing and optionally trimming 
 ## Features
 
 - Right-click Explorer integration for video compression.
+- Separate right-click **EasyCompress Settings** entry with a gear icon for launching setup.
 - One PowerShell file handles setup, uninstall, FFmpeg checks, and compression.
 - Setup TUI checks permissions, FFmpeg, FFprobe, `winget`, user `PATH`, and context-menu registration.
 - Can install FFmpeg with `winget` and add the detected FFmpeg folder to the user `PATH`.
@@ -47,6 +48,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\VideoCompressor.ps1
 
 The setup TUI can:
 
+- Install EasyCompress using the first menu choice.
 - Install or fix FFmpeg.
 - Register the Explorer context menu.
 - Unregister the Explorer context menu.
@@ -74,6 +76,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\VideoCompressor.ps1 -U
 5. Click **Compress**.
 
 The output is written next to the input file with a suffix such as `video_720p.mp4`.
+
+To reopen setup from Explorer, right-click a file and choose **EasyCompress Settings**.
 
 ## Notes
 

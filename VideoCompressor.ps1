@@ -14,13 +14,17 @@ $ContextMenuKey = "HKCU\Software\Classes\*\shell\CompressVideo"
 $VideoContextMenuKey = "HKCU\Software\Classes\SystemFileAssociations\video\shell\CompressVideo"
 $ContextMenuSubKey = "Software\Classes\*\shell\CompressVideo"
 $VideoContextMenuSubKey = "Software\Classes\SystemFileAssociations\video\shell\CompressVideo"
+$SettingsContextMenuSubKey = "Software\Classes\*\shell\EasyCompressSettings"
+$VideoSettingsContextMenuSubKey = "Software\Classes\SystemFileAssociations\video\shell\EasyCompressSettings"
 $LegacyContextMenuKeys = @(
     "HKCR\*\shell\CompressVideo",
     "HKCR\SystemFileAssociations\video\shell\CompressVideo"
 )
 $LegacyContextMenuSubKeys = @(
     "*\shell\CompressVideo",
-    "SystemFileAssociations\video\shell\CompressVideo"
+    "SystemFileAssociations\video\shell\CompressVideo",
+    "*\shell\EasyCompressSettings",
+    "SystemFileAssociations\video\shell\EasyCompressSettings"
 )
 $script:ReadinessCache = $null
 
@@ -234,7 +238,9 @@ function Install-FFmpegWithWinget {
 }
 
 function Register-ContextMenu {
-    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" `"%1`""
+    $compressCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" `"%1`""
+    $settingsCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    $settingsIcon = "%SystemRoot%\ImmersiveControlPanel\SystemSettings.exe"
 
     foreach ($subKey in @($ContextMenuSubKey, $VideoContextMenuSubKey)) {
         try {
@@ -244,7 +250,28 @@ function Register-ContextMenu {
             $key.Close()
 
             $commandKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$subKey\command")
-            $commandKey.SetValue("", $command, [Microsoft.Win32.RegistryValueKind]::String)
+            $commandKey.SetValue("", $compressCommand, [Microsoft.Win32.RegistryValueKind]::String)
+            $commandKey.Close()
+        } catch {
+            if (-not (Test-IsAdministrator)) {
+                Write-Host "Registry write failed. Opening an Administrator window to retry registration." -ForegroundColor Yellow
+                Start-Elevated -Arguments @("-Register")
+            }
+
+            throw
+        }
+    }
+
+    foreach ($subKey in @($SettingsContextMenuSubKey, $VideoSettingsContextMenuSubKey)) {
+        try {
+            $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey)
+            $key.SetValue("MUIVerb", "EasyCompress Settings", [Microsoft.Win32.RegistryValueKind]::String)
+            $key.SetValue("Icon", $settingsIcon, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            $key.SetValue("Position", "Bottom", [Microsoft.Win32.RegistryValueKind]::String)
+            $key.Close()
+
+            $commandKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$subKey\command")
+            $commandKey.SetValue("", $settingsCommand, [Microsoft.Win32.RegistryValueKind]::String)
             $commandKey.Close()
         } catch {
             if (-not (Test-IsAdministrator)) {
@@ -257,11 +284,11 @@ function Register-ContextMenu {
     }
 
     Write-Host "Context menu registered for the current user." -ForegroundColor Green
-    Write-Host "Right-click a video file and choose 'Compress Video'."
+    Write-Host "Right-click a video file and choose 'Compress Video' or 'EasyCompress Settings'."
 }
 
 function Unregister-ContextMenu {
-    foreach ($subKey in @($ContextMenuSubKey, $VideoContextMenuSubKey)) {
+    foreach ($subKey in @($ContextMenuSubKey, $VideoContextMenuSubKey, $SettingsContextMenuSubKey, $VideoSettingsContextMenuSubKey)) {
         try {
             [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($subKey, $false)
         } catch {
@@ -286,18 +313,24 @@ function Unregister-ContextMenu {
 }
 
 function Test-ContextMenuRegistered {
-    $key = $null
+    $compressKey = $null
+    $settingsKey = $null
     try {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$ContextMenuSubKey\command", $false)
-        if (-not $key) {
+        $compressKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$ContextMenuSubKey\command", $false)
+        $settingsKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$SettingsContextMenuSubKey\command", $false)
+        if (-not $compressKey -or -not $settingsKey) {
             return $false
         }
 
-        $value = [string]$key.GetValue("")
-        return $value -match [regex]::Escape($ScriptPath)
+        $compressValue = [string]$compressKey.GetValue("")
+        $settingsValue = [string]$settingsKey.GetValue("")
+        return (($compressValue -match [regex]::Escape($ScriptPath)) -and ($settingsValue -match [regex]::Escape($ScriptPath)))
     } finally {
-        if ($key) {
-            $key.Close()
+        if ($compressKey) {
+            $compressKey.Close()
+        }
+        if ($settingsKey) {
+            $settingsKey.Close()
         }
     }
 }
@@ -459,6 +492,16 @@ function Format-Seconds {
     return "{0:D2}:{1:D2}:{2:D2}" -f ([int]$time.TotalHours), $time.Minutes, $time.Seconds
 }
 
+function Install-EasyCompressFromTui {
+    $ffmpeg = Get-FFmpegStatus
+    if (-not $ffmpeg.Ready) {
+        Install-OrFixFFmpegFromTui
+    }
+
+    Register-ContextMenu
+    Write-Host "Install complete." -ForegroundColor Green
+}
+
 function Show-SetupTui {
     $forceRefresh = $true
 
@@ -483,32 +526,38 @@ function Show-SetupTui {
         }
 
         Write-Host "Actions"
-        Write-Host "  1. Install or fix FFmpeg PATH"
-        Write-Host "  2. Register Explorer context menu"
-        Write-Host "  3. Unregister Explorer context menu"
-        Write-Host "  4. Remove old admin/HKCR entries"
-        Write-Host "  5. Refresh checks"
+        Write-Host "  1. Install"
+        Write-Host "  2. Install or fix FFmpeg PATH"
+        Write-Host "  3. Register Explorer context menu"
+        Write-Host "  4. Unregister Explorer context menu"
+        Write-Host "  5. Remove old admin/HKCR entries"
+        Write-Host "  6. Refresh checks"
         Write-Host "  0. Exit"
         Write-Host ""
 
         $choice = Read-Host "Choose"
         switch ($choice) {
             "1" {
-                Install-OrFixFFmpegFromTui
+                Install-EasyCompressFromTui
                 $forceRefresh = $true
                 Read-Host "Press Enter to continue"
             }
             "2" {
-                Register-ContextMenu
+                Install-OrFixFFmpegFromTui
                 $forceRefresh = $true
                 Read-Host "Press Enter to continue"
             }
             "3" {
-                Unregister-ContextMenu
+                Register-ContextMenu
                 $forceRefresh = $true
                 Read-Host "Press Enter to continue"
             }
             "4" {
+                Unregister-ContextMenu
+                $forceRefresh = $true
+                Read-Host "Press Enter to continue"
+            }
+            "5" {
                 if (-not (Test-IsAdministrator)) {
                     Write-Host "Old HKCR entries require Administrator rights to remove." -ForegroundColor Yellow
                     $elevate = Read-Host "Open an Administrator window for cleanup? [Y/N]"
@@ -524,7 +573,7 @@ function Show-SetupTui {
                 $forceRefresh = $true
                 Read-Host "Press Enter to continue"
             }
-            "5" { $forceRefresh = $true }
+            "6" { $forceRefresh = $true }
             "0" { return }
             default {
                 Write-Host "Unknown option." -ForegroundColor Yellow
