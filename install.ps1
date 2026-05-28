@@ -12,6 +12,7 @@ $NoCacheHeaders = @{
     "Cache-Control" = "no-cache, no-store, must-revalidate"
     "Pragma" = "no-cache"
 }
+$BackupMade = $false
 
 function Write-InstallerStatus {
     param([string]$Message)
@@ -20,12 +21,16 @@ function Write-InstallerStatus {
 
 function Get-PowerShellExe {
     $pwsh = Get-Command "pwsh.exe" -ErrorAction SilentlyContinue
-    if ($pwsh) {
+    if ($pwsh -and $pwsh.Source -and (Test-Path -LiteralPath $pwsh.Source)) {
         return $pwsh.Source
     }
 
-    $powershell = Get-Command "powershell.exe" -ErrorAction Stop
-    return $powershell.Source
+    $powershell = Get-Command "powershell.exe" -ErrorAction SilentlyContinue
+    if ($powershell -and $powershell.Source -and (Test-Path -LiteralPath $powershell.Source)) {
+        return $powershell.Source
+    }
+
+    return "powershell.exe"
 }
 
 function ConvertTo-WindowsArgument {
@@ -88,6 +93,28 @@ function Invoke-InstalledApp {
     Start-Process -FilePath $exe -ArgumentList $argumentList
 }
 
+function Test-DownloadedScript {
+    param([string]$Path)
+
+    $downloaded = Get-Item -LiteralPath $Path
+    if ($downloaded.Length -lt 10000) {
+        throw "Downloaded script is unexpectedly small."
+    }
+
+    $head = Get-Content -LiteralPath $Path -TotalCount 30 -ErrorAction Stop
+    if (($head -join "`n") -notmatch "VideoCompressor") {
+        throw "Downloaded file does not look like VideoCompressor.ps1."
+    }
+
+    $tokens = $null
+    $errors = $null
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $null = [System.Management.Automation.Language.Parser]::ParseFile($resolvedPath, [ref]$tokens, [ref]$errors)
+    if ($errors -and $errors.Count -gt 0) {
+        throw "Downloaded script has PowerShell parse errors."
+    }
+}
+
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -95,24 +122,17 @@ try {
         New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
     }
 
-    $cacheBuster = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $cacheBuster = [DateTime]::UtcNow.Ticks
     $downloadUrl = "$ScriptUrl`?v=$cacheBuster"
 
     Write-InstallerStatus "Downloading latest script..."
     Invoke-WebRequest -Uri $downloadUrl -OutFile $TempScript -UseBasicParsing -Headers $NoCacheHeaders
 
-    $downloaded = Get-Item -LiteralPath $TempScript
-    if ($downloaded.Length -lt 10000) {
-        throw "Downloaded script is unexpectedly small."
-    }
-
-    $head = Get-Content -LiteralPath $TempScript -TotalCount 20 -ErrorAction Stop
-    if (($head -join "`n") -notmatch "VideoCompressor") {
-        throw "Downloaded file does not look like VideoCompressor.ps1."
-    }
+    Test-DownloadedScript -Path $TempScript
 
     if (Test-Path -LiteralPath $InstalledScript) {
         Copy-Item -LiteralPath $InstalledScript -Destination $BackupScript -Force
+        $BackupMade = $true
     }
 
     Move-Item -LiteralPath $TempScript -Destination $InstalledScript -Force
@@ -127,8 +147,16 @@ try {
         Remove-Item -LiteralPath $TempScript -Force -ErrorAction SilentlyContinue
     }
 
-    if ((-not (Test-Path -LiteralPath $InstalledScript)) -and (Test-Path -LiteralPath $BackupScript)) {
+    if ($BackupMade -and (Test-Path -LiteralPath $BackupScript)) {
         Copy-Item -LiteralPath $BackupScript -Destination $InstalledScript -Force
+    } elseif ((-not (Test-Path -LiteralPath $InstalledScript)) -and (Test-Path -LiteralPath $BackupScript)) {
+        Copy-Item -LiteralPath $BackupScript -Destination $InstalledScript -Force
+    } elseif ((Test-Path -LiteralPath $InstalledScript) -and (Test-Path -LiteralPath $BackupScript)) {
+        try {
+            Test-DownloadedScript -Path $InstalledScript
+        } catch {
+            Copy-Item -LiteralPath $BackupScript -Destination $InstalledScript -Force
+        }
     }
 
     if (Test-Path -LiteralPath $InstalledScript) {

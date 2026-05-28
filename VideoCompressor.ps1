@@ -225,7 +225,10 @@ function Find-Executable {
         "$env:ProgramFiles\ffmpeg\bin\$Name",
         "${env:ProgramFiles(x86)}\ffmpeg\bin\$Name",
         "$LocalAppDataRoot\Programs\ffmpeg\bin\$Name",
-        "$LocalAppDataRoot\Programs\FFmpeg\bin\$Name"
+        "$LocalAppDataRoot\Programs\FFmpeg\bin\$Name",
+        "$env:ProgramData\chocolatey\bin\$Name",
+        "$env:USERPROFILE\scoop\shims\$Name",
+        "$env:ProgramData\scoop\shims\$Name"
     ) | Where-Object { $_ }
 
     foreach ($candidate in $directCandidates) {
@@ -333,13 +336,14 @@ function Install-FFmpegWithWinget {
     }
 
     Write-Log "Installing FFmpeg with winget."
-    $process = Start-Process -FilePath $winget.Source -ArgumentList @(
+    $wingetArguments = ConvertTo-ProcessArgumentString -Arguments @(
         "install",
         "--id", "Gyan.FFmpeg",
         "--exact",
         "--accept-package-agreements",
         "--accept-source-agreements"
-    ) -Wait -PassThru
+    )
+    $process = Start-Process -FilePath $winget.Source -ArgumentList $wingetArguments -Wait -PassThru
 
     if ($process.ExitCode -ne 0) {
         if (-not (Test-IsAdministrator)) {
@@ -360,8 +364,9 @@ function Install-FFmpegWithWinget {
 }
 
 function Register-ContextMenu {
-    $compressCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" `"%1`""
-    $settingsCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    $powerShellExe = Get-PowerShellExe
+    $compressCommand = ((@($powerShellExe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", $ScriptPath) | ForEach-Object { ConvertTo-WindowsArgument $_ }) + '"%1"') -join " "
+    $settingsCommand = ConvertTo-ProcessArgumentString -Arguments @($powerShellExe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $ScriptPath)
     $settingsIcon = "%SystemRoot%\ImmersiveControlPanel\SystemSettings.exe"
 
     foreach ($subKey in @($ContextMenuSubKey, $VideoContextMenuSubKey)) {
@@ -458,13 +463,25 @@ function Test-ContextMenuRegistered {
 }
 
 function Test-UserRegistryWritable {
-    $testKey = "HKCU\Software\Classes\VideoCompressorPermissionTest"
-    & reg.exe add $testKey /ve /d "ok" /f 2>$null | Out-Null
-    $addOk = $LASTEXITCODE -eq 0
-    if ($addOk) {
-        & reg.exe delete $testKey /f 2>$null | Out-Null
+    $subKey = "Software\Classes\VideoCompressorPermissionTest"
+    $key = $null
+    try {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey)
+        $key.SetValue("", "ok", [Microsoft.Win32.RegistryValueKind]::String)
+        $key.Close()
+        $key = $null
+        [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($subKey, $false)
+        return $true
+    } catch {
+        try {
+            if ($key) {
+                $key.Close()
+            }
+            [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($subKey, $false)
+        } catch {
+        }
+        return $false
     }
-    return $addOk
 }
 
 function Test-UserPathWritable {
