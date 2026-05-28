@@ -23,6 +23,20 @@ A single-file Windows context menu tool for compressing and optionally trimming 
 
 ## Setup
 
+Install or launch with one command:
+
+```powershell
+irm "https://raw.githubusercontent.com/Nif00/CompressedAndShipped/main/install.ps1" | iex
+```
+
+The bootstrap downloads `VideoCompressor.ps1` to:
+
+```text
+%LOCALAPPDATA%\Programs\VideoCompressor\VideoCompressor.ps1
+```
+
+It downloads to a temporary file first, validates the result, then replaces the installed script. If an update fails but an older installed copy exists, it launches the existing copy instead of leaving the app broken.
+
 Move this folder to a permanent location before registration. The context menu points to the script path, so moving the folder afterward will break the registered command.
 
 Open the setup TUI:
