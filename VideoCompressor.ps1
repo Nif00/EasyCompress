@@ -1290,11 +1290,14 @@ function Show-CompressorUi {
                 Start-Sleep -Milliseconds 200
             }
 
-            Write-Log "FFmpeg process exited. ExitCode: $($process.ExitCode)"
+            $process.WaitForExit()
+            $process.Refresh()
+            $exitCode = $process.ExitCode
+            Write-Log "FFmpeg process exited. ExitCode: $exitCode"
             Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
             Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
 
-            if ($process.ExitCode -eq 0) {
+            if ($exitCode -eq 0) {
                 $originalFile = Get-Item -LiteralPath $Path
                 $newFile = Get-Item -LiteralPath $outputFile
                 $newFile.CreationTime = $originalFile.CreationTime
@@ -1303,7 +1306,7 @@ function Show-CompressorUi {
                 $form.Close()
             } else {
                 $statusLabel.Text = "Error occurred."
-                [System.Windows.Forms.MessageBox]::Show("FFmpeg failed with exit code $($process.ExitCode).`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
+                [System.Windows.Forms.MessageBox]::Show("FFmpeg failed with exit code $exitCode.`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
                 $compressBtn.Enabled = $true
                 $cmbResolution.Enabled = $true
                 $cmbCompression.Enabled = $true
