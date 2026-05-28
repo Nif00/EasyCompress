@@ -27,7 +27,7 @@ A single-file Windows context menu tool for compressing and optionally trimming 
 Install or launch with one command:
 
 ```powershell
-irm "https://raw.githubusercontent.com/Nif00/EasyCompress/main/install.ps1" | iex
+irm "https://raw.githubusercontent.com/Nif00/EasyCompress/main/install.ps1?$(Get-Random)" | iex
 ```
 
 The bootstrap downloads `VideoCompressor.ps1` to:

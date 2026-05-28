@@ -6,6 +6,10 @@ $InstalledScript = Join-Path $InstallRoot "VideoCompressor.ps1"
 $TempScript = Join-Path $InstallRoot "VideoCompressor.ps1.download"
 $BackupScript = Join-Path $InstallRoot "VideoCompressor.ps1.backup"
 $ScriptUrl = "https://raw.githubusercontent.com/Nif00/EasyCompress/main/VideoCompressor.ps1"
+$NoCacheHeaders = @{
+    "Cache-Control" = "no-cache, no-store, must-revalidate"
+    "Pragma" = "no-cache"
+}
 
 function Write-InstallerStatus {
     param([string]$Message)
@@ -41,8 +45,11 @@ try {
         New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
     }
 
+    $cacheBuster = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $downloadUrl = "$ScriptUrl`?v=$cacheBuster"
+
     Write-InstallerStatus "Downloading latest script..."
-    Invoke-WebRequest -Uri $ScriptUrl -OutFile $TempScript -UseBasicParsing
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $TempScript -UseBasicParsing -Headers $NoCacheHeaders
 
     $downloaded = Get-Item -LiteralPath $TempScript
     if ($downloaded.Length -lt 10000) {
@@ -59,7 +66,9 @@ try {
     }
 
     Move-Item -LiteralPath $TempScript -Destination $InstalledScript -Force
+    $hash = (Get-FileHash -LiteralPath $InstalledScript -Algorithm SHA256).Hash.Substring(0, 12)
     Write-InstallerStatus "Installed to $InstalledScript"
+    Write-InstallerStatus "Installed script hash: $hash"
     Invoke-InstalledApp
 } catch {
     Write-Host "[VideoCompressor] Install/update failed: $($_.Exception.Message)" -ForegroundColor Red
