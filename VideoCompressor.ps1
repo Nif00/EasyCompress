@@ -145,14 +145,9 @@ function Invoke-LoggedProcess {
 
     $argumentString = ConvertTo-ProcessArgumentString -Arguments $Arguments
     $encoding = [System.Text.UTF8Encoding]::new($false)
-    $stdoutWriter = $null
-    $stderrWriter = $null
     $process = $null
 
     try {
-        $stdoutWriter = [System.IO.StreamWriter]::new($StdOutPath, $false, $encoding)
-        $stderrWriter = [System.IO.StreamWriter]::new($StdErrPath, $false, $encoding)
-
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $FilePath
         $startInfo.Arguments = $argumentString
@@ -163,35 +158,24 @@ function Invoke-LoggedProcess {
 
         $process = [System.Diagnostics.Process]::new()
         $process.StartInfo = $startInfo
-        $process.add_OutputDataReceived({
-            param($sender, $eventArgs)
-            if ($null -ne $eventArgs.Data) {
-                $stdoutWriter.WriteLine($eventArgs.Data)
-                $stdoutWriter.Flush()
-            }
-        })
-        $process.add_ErrorDataReceived({
-            param($sender, $eventArgs)
-            if ($null -ne $eventArgs.Data) {
-                $stderrWriter.WriteLine($eventArgs.Data)
-                $stderrWriter.Flush()
-            }
-        })
 
         if (-not $process.Start()) {
             throw "The process did not start."
         }
 
-        $process.BeginOutputReadLine()
-        $process.BeginErrorReadLine()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
 
         while (-not $process.WaitForExit(200)) {
             [System.Windows.Forms.Application]::DoEvents()
         }
 
         $process.WaitForExit()
-        $stdoutWriter.Flush()
-        $stderrWriter.Flush()
+        $stdoutTask.Wait()
+        $stderrTask.Wait()
+
+        [System.IO.File]::WriteAllText($StdOutPath, [string]$stdoutTask.Result, $encoding)
+        [System.IO.File]::WriteAllText($StdErrPath, [string]$stderrTask.Result, $encoding)
 
         return [pscustomobject]@{
             Id = $process.Id
@@ -202,13 +186,64 @@ function Invoke-LoggedProcess {
         if ($null -ne $process) {
             $process.Dispose()
         }
-        if ($null -ne $stdoutWriter) {
-            $stdoutWriter.Dispose()
+    }
+}
+
+function Test-CompletedFfmpegOutput {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [Parameter(Mandatory = $true)][string]$StdErrPath
+    )
+
+    try {
+        $output = Get-Item -LiteralPath $OutputPath -ErrorAction Stop
+        if ($output.Length -le 0) {
+            Write-Log "Output fallback check failed: output is empty."
+            return $false
         }
-        if ($null -ne $stderrWriter) {
-            $stderrWriter.Dispose()
+
+        if (-not (Test-Path -LiteralPath $StdErrPath)) {
+            Write-Log "Output fallback check failed: FFmpeg stderr log missing."
+            return $false
+        }
+
+        $tail = Get-Content -LiteralPath $StdErrPath -Tail 160 -ErrorAction Stop
+        if (($tail -match "Lsize=") -or ($tail -match "muxing overhead")) {
+            Write-Log "Output fallback check passed. Output size: $($output.Length)"
+            return $true
+        }
+
+        Write-Log "Output fallback check failed: FFmpeg completion markers missing."
+        return $false
+    } catch {
+        Write-Log "Output fallback check exception: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Set-OutputTimestamps {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$OutputPath
+    )
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 8; $attempt++) {
+        try {
+            $originalFile = Get-Item -LiteralPath $SourcePath -ErrorAction Stop
+            $newFile = Get-Item -LiteralPath $OutputPath -ErrorAction Stop
+            $newFile.CreationTime = $originalFile.CreationTime
+            $newFile.LastWriteTime = $originalFile.LastWriteTime
+            Write-Log "Output timestamps copied from source on attempt $attempt."
+            return $newFile
+        } catch {
+            $lastError = $_.Exception.Message
+            Write-Log "Timestamp copy attempt $attempt failed: $lastError"
+            Start-Sleep -Milliseconds 250
         }
     }
+
+    throw "Could not copy timestamps to output file. $lastError"
 }
 
 function Test-IsAdministrator {
@@ -1366,11 +1401,14 @@ function Show-CompressorUi {
             Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
             Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
 
-            if ($exitCode -eq 0) {
-                $originalFile = Get-Item -LiteralPath $Path
-                $newFile = Get-Item -LiteralPath $outputFile
-                $newFile.CreationTime = $originalFile.CreationTime
-                $newFile.LastWriteTime = $originalFile.LastWriteTime
+            $compressionSucceeded = ($exitCode -eq 0)
+            if (-not $compressionSucceeded -and (Test-CompletedFfmpegOutput -OutputPath $outputFile -StdErrPath $ffmpegStdErr)) {
+                Write-Log "FFmpeg exit code was not clean, but output is complete. Continuing."
+                $compressionSucceeded = $true
+            }
+
+            if ($compressionSucceeded) {
+                $newFile = Set-OutputTimestamps -SourcePath $Path -OutputPath $outputFile
                 Write-Log "Compression succeeded. Output size: $($newFile.Length)"
                 $form.Close()
             } else {
