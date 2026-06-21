@@ -1,4 +1,7 @@
 $ErrorActionPreference = "Stop"
+# Invoke-WebRequest's progress stream is extremely slow on Windows PowerShell 5.1 and can
+# stall the download on some machines; suppressing it makes the one-line install reliable.
+$ProgressPreference = "SilentlyContinue"
 
 $AppName = "VideoCompressor"
 $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData) }
@@ -86,6 +89,7 @@ function Invoke-InstalledApp {
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
+        "-Sta",
         "-File",
         $InstalledScript
     )

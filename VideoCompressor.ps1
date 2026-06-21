@@ -9,6 +9,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Invoke-WebRequest's progress stream is extremely slow on Windows PowerShell 5.1 and
+# can stall downloads on some machines; suppressing it makes the in-app updater reliable.
+$ProgressPreference = "SilentlyContinue"
 $ScriptPath = $PSCommandPath
 $TempRoot = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
 $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData) }
@@ -43,8 +46,13 @@ $script:InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
 
 function Write-Log {
     param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "[$timestamp] $Message" | Out-File -FilePath $LogFile -Append -Encoding utf8
+    try {
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        "[$timestamp] $Message" | Out-File -FilePath $LogFile -Append -Encoding utf8 -ErrorAction Stop
+    } catch {
+        # Logging is best-effort. With $ErrorActionPreference = 'Stop', a locked log file
+        # (antivirus scan, a concurrent compress run) would otherwise crash the whole app.
+    }
 }
 
 function Write-LogFileTail {
@@ -252,7 +260,10 @@ function Set-OutputTimestamps {
         }
     }
 
-    throw "Could not copy timestamps to output file. $lastError"
+    Write-Log "Could not copy timestamps to output file after retries. $lastError"
+    # Copying timestamps is a nicety, not a requirement. A briefly locked output file
+    # (antivirus, Explorer thumbnail) must not turn a successful compression into a failure.
+    return (Get-Item -LiteralPath $OutputPath -ErrorAction SilentlyContinue)
 }
 
 function Test-IsAdministrator {
@@ -264,33 +275,9 @@ function Test-IsAdministrator {
 function Start-Elevated {
     param([string[]]$Arguments)
 
-    $argumentList = ConvertTo-ProcessArgumentString -Arguments (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $ScriptPath) + $Arguments)
+    $argumentList = ConvertTo-ProcessArgumentString -Arguments (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-Sta", "-File", $ScriptPath) + $Arguments)
     Start-Process -FilePath (Get-PowerShellExe) -ArgumentList $argumentList -Verb RunAs
     exit
-}
-
-function Ensure-AdminForSetup {
-    if (Test-IsAdministrator) {
-        return
-    }
-
-    Write-Host "Setup and maintenance actions need an Administrator window. Requesting elevation..." -ForegroundColor Yellow
-
-    $arguments = @()
-    if ($Register) {
-        $arguments += "-Register"
-    }
-    if ($Unregister) {
-        $arguments += "-Unregister"
-    }
-    if ($InstallFFmpeg) {
-        $arguments += "-InstallFFmpeg"
-    }
-    if ($Update) {
-        $arguments += "-Update"
-    }
-
-    Start-Elevated -Arguments $arguments
 }
 
 function Test-ExecutableInPath {
@@ -488,8 +475,8 @@ function Install-FFmpegWithWinget {
 
 function Register-ContextMenu {
     $powerShellExe = Get-PowerShellExe
-    $compressCommand = ((@($powerShellExe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", $ScriptPath) | ForEach-Object { ConvertTo-WindowsArgument $_ }) + '"%1"') -join " "
-    $settingsCommand = ConvertTo-ProcessArgumentString -Arguments @($powerShellExe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $ScriptPath)
+    $compressCommand = ((@($powerShellExe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Sta", "-WindowStyle", "Hidden", "-File", $ScriptPath) | ForEach-Object { ConvertTo-WindowsArgument $_ }) + '"%1"') -join " "
+    $settingsCommand = ConvertTo-ProcessArgumentString -Arguments @($powerShellExe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Sta", "-File", $ScriptPath)
     $settingsIcon = "%SystemRoot%\ImmersiveControlPanel\SystemSettings.exe"
 
     foreach ($subKey in @($ContextMenuSubKey, $VideoContextMenuSubKey)) {
@@ -592,6 +579,7 @@ function Start-UpdatedScript {
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
+        "-Sta",
         "-File",
         $Path
     )
@@ -1164,8 +1152,8 @@ function Show-CompressorUi {
     }
 
     $startDrag = {
-        param($sender, $event)
-        if ($event.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        param($eventSender, $eventArgs)
+        if ($eventArgs.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
             $dragState.Active = $true
             $dragState.Cursor = [System.Windows.Forms.Control]::MousePosition
             $dragState.Form = $form.Location
@@ -1458,8 +1446,12 @@ function Show-CompressorUi {
         $selectedLevel = $levels | Where-Object { $_.Name -eq [string]$cmbCompression.SelectedItem } | Select-Object -First 1
         $crf = $selectedLevel.CRF
 
-        $basePath = [System.IO.Path]::ChangeExtension($Path, $null)
-        $outputFile = "${basePath}_$suffix.mp4"
+        # NOTE: [Path]::ChangeExtension($Path, $null) leaves a trailing dot in PowerShell
+        # (the $null is coerced to ""), producing names like "clip._720p.mp4". Build the
+        # name from the parts instead.
+        $outputDirectory = [System.IO.Path]::GetDirectoryName($Path)
+        $outputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+        $outputFile = [System.IO.Path]::Combine($outputDirectory, "${outputBaseName}_$suffix.mp4")
         $runId = [Guid]::NewGuid().ToString("N")
         $ffmpegStdOut = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId.out.log"
         $ffmpegStdErr = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId.err.log"
@@ -1475,7 +1467,11 @@ function Show-CompressorUi {
 
         $ffmpegArgs = @("-y")
         if ($chkTrim.Checked) {
-            $ffmpegArgs += @("-ss", (Format-Seconds $trackStart.Value), "-to", (Format-Seconds $trackEnd.Value))
+            # -ss as an input option (before -i) makes FFmpeg measure -to on the post-seek
+            # output timeline, so "-ss 3 -to 6" yields 6s of video, not 3s. Use an explicit
+            # duration (-t) instead so the trimmed length always matches the slider range.
+            $trimDuration = [math]::Max(1, $trackEnd.Value - $trackStart.Value)
+            $ffmpegArgs += @("-ss", (Format-Seconds $trackStart.Value), "-t", (Format-Seconds $trimDuration))
         }
 
         $ffmpegArgs += @("-i", $Path)
@@ -1516,6 +1512,7 @@ function Show-CompressorUi {
             if ($compressionSucceeded) {
                 $newFile = Set-OutputTimestamps -SourcePath $Path -OutputPath $outputFile
                 Write-Log "Compression succeeded. Output size: $($newFile.Length)"
+                Remove-Item -LiteralPath $ffmpegStdOut, $ffmpegStdErr -Force -ErrorAction SilentlyContinue
                 $form.Close()
             } else {
                 $statusLabel.Text = "Error occurred."
@@ -1548,9 +1545,11 @@ function Show-CompressorUi {
 try {
     Write-Log "--- Script started ---"
 
-    if (-not $InputFile -and -not $Update) {
-        Ensure-AdminForSetup
-    }
+    # The setup menu runs as the invoking (non-elevated) user on purpose: the context menu
+    # lives in HKCU and FFmpeg goes on the user PATH, both of which are per-user. Elevating
+    # here would switch to the admin's profile hive on machines where the signed-in user is
+    # a standard account, silently registering everything for the wrong user. Elevation is
+    # requested only where it is actually needed (winget fallback, legacy HKCR cleanup).
 
     if ($InstallFFmpeg) {
         Add-Type -AssemblyName System.Windows.Forms
