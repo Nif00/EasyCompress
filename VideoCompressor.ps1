@@ -157,12 +157,14 @@ function Invoke-LoggedProcess {
         [Parameter(Mandatory = $true)][string]$FilePath,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [Parameter(Mandatory = $true)][string]$StdOutPath,
-        [Parameter(Mandatory = $true)][string]$StdErrPath
+        [Parameter(Mandatory = $true)][string]$StdErrPath,
+        [hashtable]$ControlState
     )
 
     $argumentString = ConvertTo-ProcessArgumentString -Arguments $Arguments
     $encoding = [System.Text.UTF8Encoding]::new($false)
     $process = $null
+    $cancelled = $false
 
     try {
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -180,11 +182,26 @@ function Invoke-LoggedProcess {
             throw "The process did not start."
         }
 
+        if ($ControlState) {
+            $ControlState.Process = $process
+        }
+
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
 
         while (-not $process.WaitForExit(200)) {
             [System.Windows.Forms.Application]::DoEvents()
+            if ($ControlState -and $ControlState.Cancelled -and -not $cancelled) {
+                $cancelled = $true
+                Write-Log "Cancellation requested; terminating FFmpeg process $($process.Id)."
+                try {
+                    if (-not $process.HasExited) {
+                        $process.Kill()
+                    }
+                } catch {
+                    Write-Log "Failed to kill FFmpeg process: $($_.Exception.Message)"
+                }
+            }
         }
 
         $process.WaitForExit()
@@ -198,8 +215,12 @@ function Invoke-LoggedProcess {
             Id = $process.Id
             ExitCode = [int]$process.ExitCode
             Arguments = $argumentString
+            Cancelled = $cancelled
         }
     } finally {
+        if ($ControlState) {
+            $ControlState.Process = $null
+        }
         if ($null -ne $process) {
             $process.Dispose()
         }
@@ -331,6 +352,7 @@ function Find-Executable {
     }
 
     $directCandidates = @(
+        "$InstallRoot\ffmpeg\bin\$Name",
         "$LocalAppDataRoot\Microsoft\WinGet\Links\$Name",
         "$env:ProgramFiles\ffmpeg\bin\$Name",
         "${env:ProgramFiles(x86)}\ffmpeg\bin\$Name",
@@ -394,7 +416,7 @@ function Ensure-FFmpeg {
     }
 
     $answer = [System.Windows.Forms.MessageBox]::Show(
-        "FFmpeg was not found. Install it now with winget and add it to your user PATH?",
+        "FFmpeg is needed to compress videos. Download it now? A copy is installed just for you and no administrator rights are required.",
         "FFmpeg Required",
         [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Question
@@ -405,7 +427,11 @@ function Ensure-FFmpeg {
         throw "FFmpeg is required to compress videos."
     }
 
-    Install-FFmpegWithWinget
+    # The compress GUI always uses the portable, per-user download here: it needs no admin,
+    # no winget, and cannot land in the wrong profile hive. (The setup menu still offers
+    # winget for people who prefer a managed install.)
+    $binDir = Install-FFmpegPortable
+    Add-DirectoryToUserPath -Directory $binDir
 
     $ffmpeg = Find-Executable "ffmpeg.exe"
     $ffprobe = Find-Executable "ffprobe.exe"
@@ -470,6 +496,66 @@ function Install-FFmpegWithWinget {
         }
 
         throw "winget failed to install FFmpeg. Exit code: $($process.ExitCode)"
+    }
+}
+
+function Install-FFmpegPortable {
+    # Downloads a self-contained FFmpeg build into the app's own folder, just for the current
+    # user. No admin rights, no winget, and it can never land in another account's profile
+    # hive (the failure mode when winget runs under a separate admin account). Returns the
+    # bin directory containing ffmpeg.exe / ffprobe.exe.
+    $ffmpegRoot = Join-Path $InstallRoot "ffmpeg"
+    $binDir = Join-Path $ffmpegRoot "bin"
+
+    if ((Test-Path -LiteralPath (Join-Path $binDir "ffmpeg.exe")) -and
+        (Test-Path -LiteralPath (Join-Path $binDir "ffprobe.exe"))) {
+        Write-Log "Portable FFmpeg already present at $binDir"
+        return $binDir
+    }
+
+    $zipUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+    $runId = [Guid]::NewGuid().ToString("N")
+    $zipPath = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId.zip"
+    $extractDir = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId"
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Write-Log "Downloading portable FFmpeg from $zipUrl"
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -Headers $NoCacheHeaders
+
+        $zipItem = Get-Item -LiteralPath $zipPath -ErrorAction Stop
+        if ($zipItem.Length -lt 1MB) {
+            throw "The downloaded FFmpeg archive is unexpectedly small ($($zipItem.Length) bytes)."
+        }
+
+        Write-Log "Extracting portable FFmpeg to $extractDir"
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+
+        $sourceFfmpeg = Get-ChildItem -LiteralPath $extractDir -Recurse -Filter "ffmpeg.exe" -ErrorAction Stop |
+            Select-Object -First 1
+        if (-not $sourceFfmpeg) {
+            throw "ffmpeg.exe was not found inside the downloaded archive."
+        }
+        $sourceBin = Split-Path -Parent $sourceFfmpeg.FullName
+
+        if (Test-Path -LiteralPath $ffmpegRoot) {
+            Remove-Item -LiteralPath $ffmpegRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+
+        foreach ($exe in @("ffmpeg.exe", "ffprobe.exe")) {
+            $source = Join-Path $sourceBin $exe
+            if (-not (Test-Path -LiteralPath $source)) {
+                throw "$exe was not found inside the downloaded archive."
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $binDir $exe) -Force
+        }
+
+        Write-Log "Portable FFmpeg installed to $binDir"
+        return $binDir
+    } finally {
+        Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -774,29 +860,44 @@ function Install-OrFixFFmpegFromTui {
         return
     }
 
-    $answer = Read-Host "FFmpeg is not installed. Install it now with winget? [Y/N]"
+    $answer = Read-Host "FFmpeg is not installed. Install it now? [Y/N]"
     if ($answer -notmatch "^(y|yes)$") {
         Write-Host "Skipped FFmpeg install." -ForegroundColor Yellow
         return
     }
 
+    if (Test-ExecutableInPath "winget.exe") {
+        try {
+            Install-FFmpegWithWinget
+            $installed = Get-FFmpegStatus
+            if ($installed.Detected) {
+                Add-DirectoryToUserPath -Directory (Split-Path -Parent $installed.FFmpegPath)
+                Write-Host "FFmpeg installed and added to user PATH." -ForegroundColor Green
+                return
+            }
+            Write-Host "winget finished, but FFmpeg was not detected for your account." -ForegroundColor Yellow
+        } catch {
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
+
+        $fallback = Read-Host "Download a self-contained FFmpeg for your account instead (no admin needed)? [Y/N]"
+        if ($fallback -notmatch "^(y|yes)$") {
+            return
+        }
+    }
+
     try {
-        Install-FFmpegWithWinget
+        Write-Host "Downloading a portable FFmpeg for your account..." -ForegroundColor Cyan
+        $binDir = Install-FFmpegPortable
+        Add-DirectoryToUserPath -Directory $binDir
         $installed = Get-FFmpegStatus
         if ($installed.Detected) {
-            Add-DirectoryToUserPath -Directory (Split-Path -Parent $installed.FFmpegPath)
-            Write-Host "FFmpeg installed and added to user PATH." -ForegroundColor Green
+            Write-Host "FFmpeg installed for your account and added to PATH." -ForegroundColor Green
         } else {
-            Write-Host "Install finished, but FFmpeg was not detected. Open a new terminal or install FFmpeg manually." -ForegroundColor Yellow
+            Write-Host "FFmpeg was downloaded to $binDir but could not be verified." -ForegroundColor Yellow
         }
     } catch {
-        Write-Host $_.Exception.Message -ForegroundColor Red
-        if (-not (Test-IsAdministrator)) {
-            $retry = Read-Host "Try again in an Administrator window? [Y/N]"
-            if ($retry -match "^(y|yes)$") {
-                Start-Elevated -Arguments @("-InstallFFmpeg")
-            }
-        }
+        Write-Host "Could not set up portable FFmpeg: $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
@@ -968,6 +1069,11 @@ function Show-CompressorUi {
     $uiState = @{
         TotalSeconds = 0
         DurationLoaded = $false
+    }
+    $compressionState = @{
+        Running = $false
+        Cancelled = $false
+        Process = $null
     }
     $themeState = @{
         Dark = $false
@@ -1369,7 +1475,15 @@ function Show-CompressorUi {
     $cancelBtn.FlatAppearance.BorderColor = $palette.PanelBorder
     $cancelBtn.BackColor = $palette.SecondaryButton
     $cancelBtn.ForeColor = $palette.TextMain
-    $cancelBtn.Add_Click({ $form.Close() })
+    $cancelBtn.Add_Click({
+        if ($compressionState.Running) {
+            $compressionState.Cancelled = $true
+            $cancelBtn.Enabled = $false
+            $statusLabel.Text = "Cancelling..."
+        } else {
+            $form.Close()
+        }
+    })
     $form.Controls.Add($cancelBtn)
 
     $compressBtn = New-Object System.Windows.Forms.Button
@@ -1438,6 +1552,22 @@ function Show-CompressorUi {
     })
     & $applyTheme
 
+    $resetControls = {
+        $compressBtn.Enabled = $true
+        $cmbResolution.Enabled = $true
+        $cmbCompression.Enabled = $true
+        $chkTrim.Enabled = $true
+        $cancelBtn.Enabled = $true
+        $progressBar.Visible = $false
+    }
+
+    $form.Add_FormClosing({
+        # Closing the window mid-encode aborts FFmpeg instead of orphaning ffmpeg.exe.
+        if ($compressionState.Running) {
+            $compressionState.Cancelled = $true
+        }
+    })
+
     $compressBtn.Add_Click({
         $selectedRes = $resolutions | Where-Object { $_.Name -eq [string]$cmbResolution.SelectedItem } | Select-Object -First 1
         $scale = $selectedRes.Scale
@@ -1456,11 +1586,13 @@ function Show-CompressorUi {
         $ffmpegStdOut = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId.out.log"
         $ffmpegStdErr = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId.err.log"
 
+        $compressionState.Cancelled = $false
+        $compressionState.Running = $true
         $compressBtn.Enabled = $false
         $cmbResolution.Enabled = $false
         $cmbCompression.Enabled = $false
         $chkTrim.Enabled = $false
-        $cancelBtn.Enabled = $false
+        $cancelBtn.Enabled = $true
         $progressBar.Visible = $true
         $statusLabel.Text = "Compressing... (FFmpeg running)"
         $form.Refresh()
@@ -1479,7 +1611,7 @@ function Show-CompressorUi {
             $ffmpegArgs += @("-vf", "scale=$scale")
         }
 
-        $ffmpegArgs += @("-c:v", "libx264", "-crf", $crf, "-preset", "slower", "-c:a", "aac", "-b:a", "128k", $outputFile)
+        $ffmpegArgs += @("-c:v", "libx264", "-crf", $crf, "-preset", "medium", "-c:a", "aac", "-b:a", "128k", $outputFile)
         $ffmpegArgumentString = ConvertTo-ProcessArgumentString -Arguments $ffmpegArgs
         Write-Log "Selected resolution: $($selectedRes.Name)"
         Write-Log "Selected scale: $scale"
@@ -1496,12 +1628,23 @@ function Show-CompressorUi {
         Write-Log "Running FFmpeg: $($tools.FFmpeg) $ffmpegArgumentString"
 
         try {
-            $processResult = Invoke-LoggedProcess -FilePath $tools.FFmpeg -Arguments $ffmpegArgs -StdOutPath $ffmpegStdOut -StdErrPath $ffmpegStdErr
+            $processResult = Invoke-LoggedProcess -FilePath $tools.FFmpeg -Arguments $ffmpegArgs -StdOutPath $ffmpegStdOut -StdErrPath $ffmpegStdErr -ControlState $compressionState
             Write-Log "FFmpeg process id: $($processResult.Id)"
             $exitCode = $processResult.ExitCode
             Write-Log "FFmpeg process exited. ExitCode: $exitCode"
             Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
             Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
+
+            if ($processResult.Cancelled) {
+                Write-Log "Compression cancelled by user; removing partial output."
+                Remove-Item -LiteralPath $outputFile -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $ffmpegStdOut, $ffmpegStdErr -Force -ErrorAction SilentlyContinue
+                if (-not $form.IsDisposed) {
+                    $statusLabel.Text = "Cancelled."
+                    & $resetControls
+                }
+                return
+            }
 
             $compressionSucceeded = ($exitCode -eq 0)
             if (-not $compressionSucceeded -and (Test-CompletedFfmpegOutput -OutputPath $outputFile -StdErrPath $ffmpegStdErr)) {
@@ -1517,12 +1660,7 @@ function Show-CompressorUi {
             } else {
                 $statusLabel.Text = "Error occurred."
                 [System.Windows.Forms.MessageBox]::Show("FFmpeg failed with exit code $exitCode.`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
-                $compressBtn.Enabled = $true
-                $cmbResolution.Enabled = $true
-                $cmbCompression.Enabled = $true
-                $chkTrim.Enabled = $true
-                $cancelBtn.Enabled = $true
-                $progressBar.Visible = $false
+                & $resetControls
             }
         } catch {
             Write-Log "FFmpeg launch/compression exception: $($_.Exception.Message)"
@@ -1530,12 +1668,9 @@ function Show-CompressorUi {
             Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
             $statusLabel.Text = "Error: $($_.Exception.Message)"
             [System.Windows.Forms.MessageBox]::Show("An error occurred: $($_.Exception.Message)`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
-            $compressBtn.Enabled = $true
-            $cmbResolution.Enabled = $true
-            $cmbCompression.Enabled = $true
-            $chkTrim.Enabled = $true
-            $cancelBtn.Enabled = $true
-            $progressBar.Visible = $false
+            & $resetControls
+        } finally {
+            $compressionState.Running = $false
         }
     })
 
