@@ -1,12 +1,27 @@
 $ErrorActionPreference = "Stop"
-# Invoke-WebRequest's progress stream is extremely slow on Windows PowerShell 5.1 and can
+# Invoke-WebRequest's progress stream is extremely slow on Windows PowerShell 5.1 and
 # stall the download on some machines; suppressing it makes the one-line install reliable.
 $ProgressPreference = "SilentlyContinue"
 
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    Write-Host "[VideoCompressor] EasyCompress cannot run under restricted PowerShell language mode (PSLockDownPolicy / WDAC). Please use a normal PowerShell session." -ForegroundColor Red
+    return
+}
+
 try { Unblock-File -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue } catch {}
-try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-} catch {}
+
+function Optimize-SecurityProtocol {
+    # .NET 4.7+ exposes SecurityProtocolType.SystemDefault which lets the OS pick the best
+    # protocol. Only patch the value if the runtime is older or the user has overridden it.
+    $isNewerNetFramework = ([System.Enum]::GetNames([System.Net.SecurityProtocolType]) -contains 'SystemDefault')
+    $isSystemDefault = $isNewerNetFramework -and ([System.Net.ServicePointManager]::SecurityProtocol.Equals([System.Net.SecurityProtocolType]::SystemDefault))
+    if (-not ($isNewerNetFramework -and $isSystemDefault)) {
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol = ([System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12)
+        } catch {}
+    }
+}
+Optimize-SecurityProtocol
 
 $AppName = "VideoCompressor"
 $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData) }
@@ -139,6 +154,54 @@ function Test-DownloadedScript {
     }
 }
 
+function Get-IwrProxyParams {
+    # Honour the standard HTTPS_PROXY env var so users behind a corporate proxy can install
+    # without code changes. Returns a hashtable that splats cleanly into Invoke-WebRequest.
+    $proxy = $env:HTTPS_PROXY
+    if (-not $proxy) { $proxy = $env:https_proxy }
+    if (-not $proxy) { return @{} }
+    if ($proxy -notmatch '^https?://') { $proxy = "http://$proxy" }
+    return @{ Proxy = $proxy }
+}
+
+function Test-IsFileLocked {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $stream.Close()
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+function Move-ItemWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [int]$MaxAttempts = 10,
+        [int]$DelaySeconds = 2
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -eq $MaxAttempts) { throw }
+            Write-InstallerStatus "Move-Item attempt $attempt failed (file likely locked). Retrying in $DelaySeconds s..."
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+}
+
+$TranscriptPath = Join-Path $env:TEMP "VideoCompressor-install-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+$TranscriptStarted = $false
+try {
+    Start-Transcript -LiteralPath $TranscriptPath -Append -ErrorAction SilentlyContinue | Out-Null
+    $TranscriptStarted = $true
+} catch {}
+
 try {
     if (-not (Test-Path -LiteralPath $InstallRoot)) {
         New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
@@ -154,6 +217,7 @@ try {
         Headers = $NoCacheHeaders
         TimeoutSec = 60
     }
+    $iwrParams += (Get-IwrProxyParams)
     if ($PSVersionTable.PSVersion.Major -lt 7) {
         $iwrParams.UseBasicParsing = $true
     }
@@ -166,7 +230,7 @@ try {
         $BackupMade = $true
     }
 
-    Move-Item -LiteralPath $TempScript -Destination $InstalledScript -Force
+    Move-ItemWithRetry -LiteralPath $TempScript -Destination $InstalledScript
     $hash = (Get-FileHash -LiteralPath $InstalledScript -Algorithm SHA256).Hash.Substring(0, 12)
     Write-InstallerStatus "Installed to $InstalledScript"
     Write-InstallerStatus "Installed script hash: $hash"
@@ -176,6 +240,7 @@ try {
     }
 } catch {
     Write-Host "[VideoCompressor] Install/update failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-InstallerStatus "Transcript: $TranscriptPath"
 
     if (Test-Path -LiteralPath $TempScript) {
         Remove-Item -LiteralPath $TempScript -Force -ErrorAction SilentlyContinue
@@ -199,5 +264,9 @@ try {
     } else {
         Write-Host "[VideoCompressor] No installed copy is available to launch." -ForegroundColor Red
         exit 1
+    }
+} finally {
+    if ($TranscriptStarted) {
+        try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
     }
 }

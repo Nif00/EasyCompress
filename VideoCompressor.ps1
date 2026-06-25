@@ -12,6 +12,14 @@ $ErrorActionPreference = "Stop"
 # Invoke-WebRequest's progress stream is extremely slow on Windows PowerShell 5.1 and
 # can stall downloads on some machines; suppressing it makes the in-app updater reliable.
 $ProgressPreference = "SilentlyContinue"
+
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    $msg = "EasyCompress cannot run under restricted PowerShell language mode (PSLockDownPolicy / WDAC). Please use a normal PowerShell session."
+    try { [System.Windows.Forms.MessageBox]::Show($msg, "EasyCompress", "OK", "Error") | Out-Null } catch { Write-Host $msg -ForegroundColor Red }
+    return
+}
+
 $ScriptPath = $PSCommandPath
 $TempRoot = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
 $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData) }
@@ -514,11 +522,19 @@ function Install-FFmpegPortable {
     $extractDir = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId"
 
     try {
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        } catch {}
+        Optimize-SecurityProtocol
         Write-Log "Downloading portable FFmpeg from $zipUrl"
-        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -Headers $NoCacheHeaders -TimeoutSec 600
+        $iwrParams = @{
+            Uri = $zipUrl
+            OutFile = $zipPath
+            Headers = $NoCacheHeaders
+            TimeoutSec = 600
+        }
+        $iwrParams += (Get-IwrProxyParams)
+        if ($PSVersionTable.PSVersion.Major -lt 7) {
+            $iwrParams.UseBasicParsing = $true
+        }
+        Invoke-WebRequest @iwrParams
 
         $zipItem = Get-Item -LiteralPath $zipPath -ErrorAction Stop
         if ($zipItem.Length -lt 1MB) {
@@ -691,15 +707,23 @@ function Update-EasyCompressFromGithub {
     $backupMade = $false
 
     try {
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        } catch {}
+        Optimize-SecurityProtocol
         $cacheBuster = [DateTime]::UtcNow.Ticks
         $downloadUrl = "$ScriptUrl`?v=$cacheBuster"
 
         Write-Host "Downloading latest EasyCompress..." -ForegroundColor Cyan
         Write-Log "Updating EasyCompress from $downloadUrl"
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempScript -UseBasicParsing -Headers $NoCacheHeaders -TimeoutSec 60
+        $iwrParams = @{
+            Uri = $downloadUrl
+            OutFile = $tempScript
+            Headers = $NoCacheHeaders
+            TimeoutSec = 60
+        }
+        $iwrParams += (Get-IwrProxyParams)
+        if ($PSVersionTable.PSVersion.Major -lt 7) {
+            $iwrParams.UseBasicParsing = $true
+        }
+        Invoke-WebRequest @iwrParams
         Test-DownloadedScript -Path $tempScript
 
         if (Test-Path -LiteralPath $targetScript) {
@@ -707,7 +731,7 @@ function Update-EasyCompressFromGithub {
             $backupMade = $true
         }
 
-        Move-Item -LiteralPath $tempScript -Destination $targetScript -Force
+        Move-ItemWithRetry -LiteralPath $tempScript -Destination $targetScript
         $hash = (Get-FileHash -LiteralPath $targetScript -Algorithm SHA256).Hash.Substring(0, 12)
         Write-Log "Updated EasyCompress at $targetScript. Hash: $hash"
         Write-Host "Updated EasyCompress." -ForegroundColor Green
@@ -798,6 +822,59 @@ function Test-UserPathWritable {
     }
 }
 
+function Optimize-SecurityProtocol {
+    # .NET 4.7+ exposes SecurityProtocolType.SystemDefault which lets the OS pick the best
+    # protocol. Only patch the value if the runtime is older or the user has overridden it.
+    $isNewerNetFramework = ([System.Enum]::GetNames([System.Net.SecurityProtocolType]) -contains 'SystemDefault')
+    $isSystemDefault = $isNewerNetFramework -and ([System.Net.ServicePointManager]::SecurityProtocol.Equals([System.Net.SecurityProtocolType]::SystemDefault))
+    if (-not ($isNewerNetFramework -and $isSystemDefault)) {
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol = ([System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12)
+        } catch {}
+    }
+}
+
+function Get-IwrProxyParams {
+    # Honour the standard HTTPS_PROXY env var so users behind a corporate proxy can install
+    # without code changes. Returns a hashtable that splats cleanly into Invoke-WebRequest.
+    $proxy = $env:HTTPS_PROXY
+    if (-not $proxy) { $proxy = $env:https_proxy }
+    if (-not $proxy) { return @{} }
+    if ($proxy -notmatch '^https?://') { $proxy = "http://$proxy" }
+    return @{ Proxy = $proxy }
+}
+
+function Test-IsFileLocked {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $stream.Close()
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+function Move-ItemWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [int]$MaxAttempts = 10,
+        [int]$DelaySeconds = 2
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -eq $MaxAttempts) { throw }
+            Write-Log "Move-Item attempt $attempt failed (file likely locked): $($_.Exception.Message). Retrying in $DelaySeconds s..."
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+}
+
 function Show-StatusLine {
     param(
         [string]$Name,
@@ -816,6 +893,40 @@ function Show-StatusLine {
     }
 }
 
+function Test-Prerequisite {
+    $psVersion = $PSVersionTable.PSVersion
+    $psOk = $psVersion.Major -ge 5 -and ($psVersion.Major -gt 5 -or $psVersion.Minor -ge 1)
+
+    $osBuild = 0
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $osBuild = [int]$os.BuildNumber
+    } catch {}
+    $osOk = $osBuild -ge 17763
+
+    $execPolicy = (Get-ExecutionPolicy).ToString()
+    $execOk = $execPolicy -in @('Unrestricted', 'RemoteSigned', 'ByPass', 'Bypass')
+
+    $languageMode = $ExecutionContext.SessionState.LanguageMode
+    $languageOk = $languageMode -eq 'FullLanguage'
+
+    $tls12 = [System.Enum]::GetNames([System.Net.SecurityProtocolType]) -contains 'Tls12'
+    $systemDefault = [System.Enum]::GetNames([System.Net.SecurityProtocolType]) -contains 'SystemDefault'
+
+    return [pscustomobject]@{
+        PowerShellOk = $psOk
+        PowerShellVersion = "$($psVersion.Major).$($psVersion.Minor).$($psVersion.Build)"
+        OsOk = $osOk
+        OsBuild = $osBuild
+        ExecutionPolicyOk = $execOk
+        ExecutionPolicy = $execPolicy
+        LanguageModeOk = $languageOk
+        LanguageMode = [string]$languageMode
+        Tls12Ok = $tls12
+        SystemDefault = $systemDefault
+    }
+}
+
 function Get-ReadinessStatus {
     param([switch]$Force)
 
@@ -830,6 +941,7 @@ function Get-ReadinessStatus {
         PathWritable = Test-UserPathWritable
         Registered = Test-ContextMenuRegistered
         Winget = Test-ExecutableInPath "winget.exe"
+        Prerequisite = Test-Prerequisite
     }
 
     return $script:ReadinessCache
@@ -850,8 +962,18 @@ function Show-ReadinessReport {
     Show-StatusLine -Name "FFmpeg in PATH" -Ok $status.FFmpeg.Ready -Detail $(if ($status.FFmpeg.Ready) { $status.FFmpeg.FFmpegPath } elseif ($status.FFmpeg.Detected) { "Detected, but not fully in PATH." } else { "Not found." })
     Show-StatusLine -Name "Context menu" -Ok $status.Registered -Detail $(if ($status.Registered) { "Registered to this script." } else { "Not registered." })
     Write-Host ""
+    Write-Host "System prerequisites" -ForegroundColor Cyan
+    $prereq = $status.Prerequisite
+    Show-StatusLine -Name "PowerShell version" -Ok $prereq.PowerShellOk -Detail $prereq.PowerShellVersion
+    Show-StatusLine -Name "OS build" -Ok $prereq.OsOk -Detail $prereq.OsBuild
+    Show-StatusLine -Name "Execution policy" -Ok $prereq.ExecutionPolicyOk -Detail $prereq.ExecutionPolicy
+    Show-StatusLine -Name "Language mode" -Ok $prereq.LanguageModeOk -Detail $prereq.LanguageMode
+    Show-StatusLine -Name "TLS 1.2" -Ok $prereq.Tls12Ok -Detail $(if ($prereq.SystemDefault) { "Available (SystemDefault honored)" } else { "Available" })
+    Write-Host ""
 
-    if ($status.RegistryWritable -and $status.PathWritable -and $status.FFmpeg.Ready -and $status.Registered) {
+    if (-not $prereq.PowerShellOk -or -not $prereq.OsOk -or -not $prereq.LanguageModeOk -or -not $prereq.Tls12Ok) {
+        Write-Host "Some prerequisites are not met. The app may not work correctly." -ForegroundColor Yellow
+    } elseif ($status.RegistryWritable -and $status.PathWritable -and $status.FFmpeg.Ready -and $status.Registered) {
         Write-Host "All clear: FFmpeg, PATH, permissions, and context menu are ready." -ForegroundColor Green
     } elseif ($status.RegistryWritable -and $status.PathWritable -and $status.FFmpeg.Ready) {
         Write-Host "All clear to register the context menu." -ForegroundColor Green
