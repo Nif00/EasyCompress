@@ -3,6 +3,11 @@ $ErrorActionPreference = "Stop"
 # stall the download on some machines; suppressing it makes the one-line install reliable.
 $ProgressPreference = "SilentlyContinue"
 
+try { Unblock-File -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue } catch {}
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {}
+
 $AppName = "VideoCompressor"
 $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData) }
 if (-not $LocalAppDataRoot) { $LocalAppDataRoot = Join-Path $env:USERPROFILE "AppData\Local" }
@@ -100,7 +105,7 @@ function Invoke-InstalledApp {
 function Test-DownloadedScript {
     param([string]$Path)
 
-    $downloaded = Get-Item -LiteralPath $Path
+    $downloaded = Get-Item -LiteralPath $Path -ErrorAction Stop
     if ($downloaded.Length -lt 10000) {
         throw "Downloaded script is unexpectedly small."
     }
@@ -113,15 +118,28 @@ function Test-DownloadedScript {
     $tokens = $null
     $errors = $null
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
-    $null = [System.Management.Automation.Language.Parser]::ParseFile($resolvedPath, [ref]$tokens, [ref]$errors)
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($resolvedPath, [ref]$tokens, [ref]$errors)
     if ($errors -and $errors.Count -gt 0) {
         throw "Downloaded script has PowerShell parse errors."
+    }
+
+    $requiredFunctions = @("Show-CompressorUi", "Register-ContextMenu", "Ensure-FFmpeg")
+    foreach ($fn in $requiredFunctions) {
+        $fnAst = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true) | Select-Object -First 1
+        if (-not $fnAst) {
+            throw "Downloaded script is missing required function '$fn'."
+        }
+        $statementCount = 0
+        if ($fnAst.Body -and $fnAst.Body.EndBlock) {
+            $statementCount = @($fnAst.Body.EndBlock.Statements).Count
+        }
+        if ($statementCount -lt 1) {
+            throw "Downloaded function '$fn' has no implementation (stub)."
+        }
     }
 }
 
 try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
     if (-not (Test-Path -LiteralPath $InstallRoot)) {
         New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
     }
@@ -130,7 +148,16 @@ try {
     $downloadUrl = "$ScriptUrl`?v=$cacheBuster"
 
     Write-InstallerStatus "Downloading latest script..."
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $TempScript -UseBasicParsing -Headers $NoCacheHeaders
+    $iwrParams = @{
+        Uri = $downloadUrl
+        OutFile = $TempScript
+        Headers = $NoCacheHeaders
+        TimeoutSec = 60
+    }
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        $iwrParams.UseBasicParsing = $true
+    }
+    Invoke-WebRequest @iwrParams
 
     Test-DownloadedScript -Path $TempScript
 
@@ -144,6 +171,9 @@ try {
     Write-InstallerStatus "Installed to $InstalledScript"
     Write-InstallerStatus "Installed script hash: $hash"
     Invoke-InstalledApp
+    if (Test-Path -LiteralPath $BackupScript) {
+        Remove-Item -LiteralPath $BackupScript -Force -ErrorAction SilentlyContinue
+    }
 } catch {
     Write-Host "[VideoCompressor] Install/update failed: $($_.Exception.Message)" -ForegroundColor Red
 
@@ -151,16 +181,16 @@ try {
         Remove-Item -LiteralPath $TempScript -Force -ErrorAction SilentlyContinue
     }
 
-    if ($BackupMade -and (Test-Path -LiteralPath $BackupScript)) {
-        Copy-Item -LiteralPath $BackupScript -Destination $InstalledScript -Force
-    } elseif ((-not (Test-Path -LiteralPath $InstalledScript)) -and (Test-Path -LiteralPath $BackupScript)) {
-        Copy-Item -LiteralPath $BackupScript -Destination $InstalledScript -Force
-    } elseif ((Test-Path -LiteralPath $InstalledScript) -and (Test-Path -LiteralPath $BackupScript)) {
+    if (Test-Path -LiteralPath $InstalledScript) {
         try {
             Test-DownloadedScript -Path $InstalledScript
         } catch {
-            Copy-Item -LiteralPath $BackupScript -Destination $InstalledScript -Force
+            if ($BackupMade -and (Test-Path -LiteralPath $BackupScript)) {
+                Copy-Item -LiteralPath $BackupScript -Destination $InstalledScript -Force
+            }
         }
+    } elseif ($BackupMade -and (Test-Path -LiteralPath $BackupScript)) {
+        Copy-Item -LiteralPath $BackupScript -Destination $InstalledScript -Force
     }
 
     if (Test-Path -LiteralPath $InstalledScript) {

@@ -93,12 +93,12 @@ function Write-DebugEnvironment {
 
 function Get-PowerShellExe {
     $pwsh = Get-Command "pwsh.exe" -ErrorAction SilentlyContinue
-    if ($pwsh -and (Test-Path -LiteralPath $pwsh.Source)) {
+    if ($pwsh -and $pwsh.Source -and (Test-Path -LiteralPath $pwsh.Source)) {
         return $pwsh.Source
     }
 
     $powershell = Get-Command "powershell.exe" -ErrorAction SilentlyContinue
-    if ($powershell -and (Test-Path -LiteralPath $powershell.Source)) {
+    if ($powershell -and $powershell.Source -and (Test-Path -LiteralPath $powershell.Source)) {
         return $powershell.Source
     }
 
@@ -297,8 +297,12 @@ function Start-Elevated {
     param([string[]]$Arguments)
 
     $argumentList = ConvertTo-ProcessArgumentString -Arguments (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-Sta", "-File", $ScriptPath) + $Arguments)
-    Start-Process -FilePath (Get-PowerShellExe) -ArgumentList $argumentList -Verb RunAs
-    exit
+    try {
+        Start-Process -FilePath (Get-PowerShellExe) -ArgumentList $argumentList -Verb RunAs
+        exit
+    } catch {
+        throw "Elevation was declined or is unavailable. Run the action again as Administrator, or accept the UAC prompt."
+    }
 }
 
 function Test-ExecutableInPath {
@@ -324,16 +328,20 @@ function Add-DirectoryToUserPath {
     }
 
     $alreadyPresent = $pathParts | Where-Object {
-        [string]::Equals($_.TrimEnd("\"), $Directory.TrimEnd("\"), [StringComparison]::OrdinalIgnoreCase)
+        [string]::Equals($_.TrimEnd([char]'\'), $Directory.TrimEnd([char]'\'), [StringComparison]::OrdinalIgnoreCase)
     }
 
-    $newPath = $currentUserPath
-    if (-not $alreadyPresent) {
-        $newPath = (@($pathParts) + $Directory) -join ";"
-        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-        Write-Log "Added directory to user PATH."
-    } else {
+    if ($alreadyPresent) {
         Write-Log "Directory already present in user PATH."
+        $newPath = $currentUserPath
+    } else {
+        $newPath = (@($pathParts) + $Directory) -join ";"
+        try {
+            [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+            Write-Log "Added directory to user PATH."
+        } catch {
+            Write-Log "Could not persist user PATH (likely too long): $($_.Exception.Message). FFmpeg is still discoverable via direct candidates in this process."
+        }
     }
 
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -482,19 +490,6 @@ function Install-FFmpegWithWinget {
     $process = Start-Process -FilePath $winget.Source -ArgumentList $wingetArguments -Wait -PassThru
 
     if ($process.ExitCode -ne 0) {
-        if (-not (Test-IsAdministrator)) {
-            $retry = [System.Windows.Forms.MessageBox]::Show(
-                "winget could not install FFmpeg without elevated permissions. Try again as Administrator?",
-                "Permission Required",
-                [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                [System.Windows.Forms.MessageBoxIcon]::Question
-            )
-
-            if ($retry -eq [System.Windows.Forms.DialogResult]::Yes) {
-                Start-Elevated -Arguments @("-InstallFFmpeg")
-            }
-        }
-
         throw "winget failed to install FFmpeg. Exit code: $($process.ExitCode)"
     }
 }
@@ -519,9 +514,11 @@ function Install-FFmpegPortable {
     $extractDir = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId"
 
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        } catch {}
         Write-Log "Downloading portable FFmpeg from $zipUrl"
-        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -Headers $NoCacheHeaders
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -Headers $NoCacheHeaders -TimeoutSec 600
 
         $zipItem = Get-Item -LiteralPath $zipPath -ErrorAction Stop
         if ($zipItem.Length -lt 1MB) {
@@ -539,7 +536,13 @@ function Install-FFmpegPortable {
         $sourceBin = Split-Path -Parent $sourceFfmpeg.FullName
 
         if (Test-Path -LiteralPath $ffmpegRoot) {
-            Remove-Item -LiteralPath $ffmpegRoot -Recurse -Force -ErrorAction SilentlyContinue
+            try {
+                Remove-Item -LiteralPath $ffmpegRoot -Recurse -Force -ErrorAction Stop
+            } catch {
+                Write-Log "First remove attempt failed, retrying: $($_.Exception.Message)"
+                Start-Sleep -Milliseconds 500
+                Remove-Item -LiteralPath $ffmpegRoot -Recurse -Force -ErrorAction Stop
+            }
         }
         New-Item -ItemType Directory -Path $binDir -Force | Out-Null
 
@@ -562,25 +565,20 @@ function Install-FFmpegPortable {
 function Register-ContextMenu {
     $powerShellExe = Get-PowerShellExe
     $compressCommand = ((@($powerShellExe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Sta", "-WindowStyle", "Hidden", "-File", $ScriptPath) | ForEach-Object { ConvertTo-WindowsArgument $_ }) + '"%1"') -join " "
-    $settingsCommand = ConvertTo-ProcessArgumentString -Arguments @($powerShellExe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Sta", "-File", $ScriptPath)
+    $settingsCommand = ConvertTo-ProcessArgumentString -Arguments @($powerShellExe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Sta", "-WindowStyle", "Hidden", "-File", $ScriptPath)
     $settingsIcon = "%SystemRoot%\ImmersiveControlPanel\SystemSettings.exe"
 
     foreach ($subKey in @($ContextMenuSubKey, $VideoContextMenuSubKey)) {
         try {
             $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey)
             $key.SetValue("MUIVerb", "Compress Video", [Microsoft.Win32.RegistryValueKind]::String)
-            $key.SetValue("Icon", "shell32.dll,216", [Microsoft.Win32.RegistryValueKind]::String)
+            $key.SetValue("Icon", "imageres.dll,77", [Microsoft.Win32.RegistryValueKind]::String)
             $key.Close()
 
             $commandKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$subKey\command")
             $commandKey.SetValue("", $compressCommand, [Microsoft.Win32.RegistryValueKind]::String)
             $commandKey.Close()
         } catch {
-            if (-not (Test-IsAdministrator)) {
-                Write-Host "Registry write failed. Opening an Administrator window to retry registration." -ForegroundColor Yellow
-                Start-Elevated -Arguments @("-Register")
-            }
-
             throw
         }
     }
@@ -597,11 +595,6 @@ function Register-ContextMenu {
             $commandKey.SetValue("", $settingsCommand, [Microsoft.Win32.RegistryValueKind]::String)
             $commandKey.Close()
         } catch {
-            if (-not (Test-IsAdministrator)) {
-                Write-Host "Registry write failed. Opening an Administrator window to retry registration." -ForegroundColor Yellow
-                Start-Elevated -Arguments @("-Register")
-            }
-
             throw
         }
     }
@@ -651,9 +644,24 @@ function Test-DownloadedScript {
     $tokens = $null
     $errors = $null
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
-    $null = [System.Management.Automation.Language.Parser]::ParseFile($resolvedPath, [ref]$tokens, [ref]$errors)
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($resolvedPath, [ref]$tokens, [ref]$errors)
     if ($errors -and $errors.Count -gt 0) {
         throw "Downloaded script has PowerShell parse errors."
+    }
+
+    $requiredFunctions = @("Show-CompressorUi", "Register-ContextMenu", "Ensure-FFmpeg")
+    foreach ($fn in $requiredFunctions) {
+        $fnAst = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true) | Select-Object -First 1
+        if (-not $fnAst) {
+            throw "Downloaded script is missing required function '$fn'."
+        }
+        $statementCount = 0
+        if ($fnAst.Body -and $fnAst.Body.EndBlock) {
+            $statementCount = @($fnAst.Body.EndBlock.Statements).Count
+        }
+        if ($statementCount -lt 1) {
+            throw "Downloaded function '$fn' has no implementation (stub)."
+        }
     }
 }
 
@@ -683,13 +691,15 @@ function Update-EasyCompressFromGithub {
     $backupMade = $false
 
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        } catch {}
         $cacheBuster = [DateTime]::UtcNow.Ticks
         $downloadUrl = "$ScriptUrl`?v=$cacheBuster"
 
         Write-Host "Downloading latest EasyCompress..." -ForegroundColor Cyan
         Write-Log "Updating EasyCompress from $downloadUrl"
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempScript -UseBasicParsing -Headers $NoCacheHeaders
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempScript -UseBasicParsing -Headers $NoCacheHeaders -TimeoutSec 60
         Test-DownloadedScript -Path $tempScript
 
         if (Test-Path -LiteralPath $targetScript) {
@@ -703,6 +713,9 @@ function Update-EasyCompressFromGithub {
         Write-Host "Updated EasyCompress." -ForegroundColor Green
         Write-Host "Script hash: $hash"
         Write-Host "Restarting updated setup menu..."
+        if (Test-Path -LiteralPath $backupScript) {
+            Remove-Item -LiteralPath $backupScript -Force -ErrorAction SilentlyContinue
+        }
         Start-UpdatedScript -Path $targetScript
         exit
     } catch {
@@ -766,12 +779,22 @@ function Test-UserRegistryWritable {
 }
 
 function Test-UserPathWritable {
+    $currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $sentinel = "VideoCompressorProbe_$([Guid]::NewGuid().ToString("N"))"
+    $probedPath = if ($currentUserPath) { "$currentUserPath;$sentinel" } else { $sentinel }
+    $probed = $false
     try {
-        $currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        [Environment]::SetEnvironmentVariable("Path", $currentUserPath, "User")
+        [Environment]::SetEnvironmentVariable("Path", $probedPath, "User")
+        $probed = $true
+        $restoredPath = if ($currentUserPath) { $currentUserPath } else { $null }
+        [Environment]::SetEnvironmentVariable("Path", $restoredPath, "User")
         return $true
     } catch {
         return $false
+    } finally {
+        if ($probed -and $currentUserPath) {
+            try { [Environment]::SetEnvironmentVariable("Path", $currentUserPath, "User") } catch {}
+        }
     }
 }
 
@@ -817,7 +840,7 @@ function Show-ReadinessReport {
 
     $status = Get-ReadinessStatus -Force:$Force
 
-    Clear-Host
+    try { Clear-Host } catch {}
     Write-Host "Video Compressor setup" -ForegroundColor Cyan
     Write-Host ""
     Show-StatusLine -Name "Admin window" -Ok $status.IsAdmin -Detail "Only needed for winget fallback or old HKCR cleanup."
@@ -1065,7 +1088,8 @@ function Show-CompressorUi {
     Write-Log "Input full name: $($inputItem.FullName)"
     Write-Log "Input size: $($inputItem.Length)"
 
-    $tools = Ensure-FFmpeg
+    try {
+        $tools = Ensure-FFmpeg
     $uiState = @{
         TotalSeconds = 0
         DurationLoaded = $false
@@ -1455,7 +1479,7 @@ function Show-CompressorUi {
 
     $trackEnd.Add_ValueChanged({
         if ($trackEnd.Value -le $trackStart.Value) {
-            $trackEnd.Value = [math]::Min([math]::Max(1, $trackEnd.Maximum), $trackStart.Value + 1)
+            $trackEnd.Value = [math]::Min($trackEnd.Maximum, $trackStart.Value + 1)
         }
         $lblEnd.Text = "End: $(Format-Seconds $trackEnd.Value)"
     })
@@ -1586,95 +1610,116 @@ function Show-CompressorUi {
         $ffmpegStdOut = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId.out.log"
         $ffmpegStdErr = Join-Path $TempRoot "EasyCompress-ffmpeg-$runId.err.log"
 
-        $compressionState.Cancelled = $false
-        $compressionState.Running = $true
-        $compressBtn.Enabled = $false
-        $cmbResolution.Enabled = $false
-        $cmbCompression.Enabled = $false
-        $chkTrim.Enabled = $false
-        $cancelBtn.Enabled = $true
-        $progressBar.Visible = $true
-        $statusLabel.Text = "Compressing... (FFmpeg running)"
-        $form.Refresh()
-
-        $ffmpegArgs = @("-y")
-        if ($chkTrim.Checked) {
-            # -ss as an input option (before -i) makes FFmpeg measure -to on the post-seek
-            # output timeline, so "-ss 3 -to 6" yields 6s of video, not 3s. Use an explicit
-            # duration (-t) instead so the trimmed length always matches the slider range.
-            $trimDuration = [math]::Max(1, $trackEnd.Value - $trackStart.Value)
-            $ffmpegArgs += @("-ss", (Format-Seconds $trackStart.Value), "-t", (Format-Seconds $trimDuration))
-        }
-
-        $ffmpegArgs += @("-i", $Path)
-        if ($scale) {
-            $ffmpegArgs += @("-vf", "scale=$scale")
-        }
-
-        $ffmpegArgs += @("-c:v", "libx264", "-crf", $crf, "-preset", "medium", "-c:a", "aac", "-b:a", "128k", $outputFile)
-        $ffmpegArgumentString = ConvertTo-ProcessArgumentString -Arguments $ffmpegArgs
-        Write-Log "Selected resolution: $($selectedRes.Name)"
-        Write-Log "Selected scale: $scale"
-        Write-Log "Selected compression: $($selectedLevel.Name)"
-        Write-Log "Selected CRF: $crf"
-        Write-Log "Trim enabled: $($chkTrim.Checked)"
-        if ($chkTrim.Checked) {
-            Write-Log "Trim start seconds: $($trackStart.Value)"
-            Write-Log "Trim end seconds: $($trackEnd.Value)"
-        }
-        Write-Log "Output file: $outputFile"
-        Write-Log "FFmpeg stdout: $ffmpegStdOut"
-        Write-Log "FFmpeg stderr: $ffmpegStdErr"
-        Write-Log "Running FFmpeg: $($tools.FFmpeg) $ffmpegArgumentString"
-
         try {
-            $processResult = Invoke-LoggedProcess -FilePath $tools.FFmpeg -Arguments $ffmpegArgs -StdOutPath $ffmpegStdOut -StdErrPath $ffmpegStdErr -ControlState $compressionState
-            Write-Log "FFmpeg process id: $($processResult.Id)"
-            $exitCode = $processResult.ExitCode
-            Write-Log "FFmpeg process exited. ExitCode: $exitCode"
-            Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
-            Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
+            $compressionState.Cancelled = $false
+            $compressionState.Running = $true
+            $compressBtn.Enabled = $false
+            $cmbResolution.Enabled = $false
+            $cmbCompression.Enabled = $false
+            $chkTrim.Enabled = $false
+            $cancelBtn.Enabled = $true
+            $progressBar.Visible = $true
+            $statusLabel.Text = "Compressing... (FFmpeg running)"
+            $form.Refresh()
 
-            if ($processResult.Cancelled) {
-                Write-Log "Compression cancelled by user; removing partial output."
-                Remove-Item -LiteralPath $outputFile -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $ffmpegStdOut, $ffmpegStdErr -Force -ErrorAction SilentlyContinue
-                if (-not $form.IsDisposed) {
-                    $statusLabel.Text = "Cancelled."
+            $ffmpegArgs = @("-y")
+            if ($chkTrim.Checked) {
+                # -ss as an input option (before -i) makes FFmpeg measure -to on the post-seek
+                # output timeline, so "-ss 3 -to 6" yields 6s of video, not 3s. Use an explicit
+                # duration (-t) instead so the trimmed length always matches the slider range.
+                $trimDuration = [math]::Max(1, $trackEnd.Value - $trackStart.Value)
+                $ffmpegArgs += @("-ss", (Format-Seconds $trackStart.Value), "-t", (Format-Seconds $trimDuration))
+            }
+
+            $ffmpegArgs += @("-i", $Path)
+            if ($scale) {
+                $ffmpegArgs += @("-vf", "scale=$scale")
+            }
+
+            $ffmpegArgs += @("-c:v", "libx264", "-crf", $crf, "-preset", "medium", "-c:a", "aac", "-b:a", "128k", $outputFile)
+            $ffmpegArgumentString = ConvertTo-ProcessArgumentString -Arguments $ffmpegArgs
+            Write-Log "Selected resolution: $($selectedRes.Name)"
+            Write-Log "Selected scale: $scale"
+            Write-Log "Selected compression: $($selectedLevel.Name)"
+            Write-Log "Selected CRF: $crf"
+            Write-Log "Trim enabled: $($chkTrim.Checked)"
+            if ($chkTrim.Checked) {
+                Write-Log "Trim start seconds: $($trackStart.Value)"
+                Write-Log "Trim end seconds: $($trackEnd.Value)"
+            }
+            Write-Log "Output file: $outputFile"
+            Write-Log "FFmpeg stdout: $ffmpegStdOut"
+            Write-Log "FFmpeg stderr: $ffmpegStdErr"
+            Write-Log "Running FFmpeg: $($tools.FFmpeg) $ffmpegArgumentString"
+
+            try {
+                $processResult = Invoke-LoggedProcess -FilePath $tools.FFmpeg -Arguments $ffmpegArgs -StdOutPath $ffmpegStdOut -StdErrPath $ffmpegStdErr -ControlState $compressionState
+                Write-Log "FFmpeg process id: $($processResult.Id)"
+                $exitCode = $processResult.ExitCode
+                Write-Log "FFmpeg process exited. ExitCode: $exitCode"
+                Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
+                Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
+
+                if ($processResult.Cancelled) {
+                    Write-Log "Compression cancelled by user; removing partial output."
+                    Remove-Item -LiteralPath $outputFile -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $ffmpegStdOut, $ffmpegStdErr -Force -ErrorAction SilentlyContinue
+                    if (-not $form.IsDisposed) {
+                        $statusLabel.Text = "Cancelled."
+                        & $resetControls
+                    }
+                    return
+                }
+
+                $compressionSucceeded = ($exitCode -eq 0)
+                if ($compressionSucceeded) {
+                    if (-not (Test-CompletedFfmpegOutput -OutputPath $outputFile -StdErrPath $ffmpegStdErr)) {
+                        Write-Log "FFmpeg exited cleanly but output is missing or truncated."
+                        $compressionSucceeded = $false
+                    }
+                } elseif (Test-CompletedFfmpegOutput -OutputPath $outputFile -StdErrPath $ffmpegStdErr) {
+                    Write-Log "FFmpeg exit code was not clean, but output is complete. Continuing."
+                    $compressionSucceeded = $true
+                }
+
+                if ($compressionSucceeded) {
+                    $newFile = Set-OutputTimestamps -SourcePath $Path -OutputPath $outputFile
+                    if ($newFile) {
+                        Write-Log "Compression succeeded. Output size: $($newFile.Length)"
+                    } else {
+                        Write-Log "Compression succeeded. Output file could not be inspected for size (likely transient AV lock)."
+                    }
+                    Remove-Item -LiteralPath $ffmpegStdOut, $ffmpegStdErr -Force -ErrorAction SilentlyContinue
+                    $form.Close()
+                } else {
+                    $statusLabel.Text = "Error occurred."
+                    [System.Windows.Forms.MessageBox]::Show("FFmpeg failed with exit code $exitCode.`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
                     & $resetControls
                 }
-                return
-            }
-
-            $compressionSucceeded = ($exitCode -eq 0)
-            if (-not $compressionSucceeded -and (Test-CompletedFfmpegOutput -OutputPath $outputFile -StdErrPath $ffmpegStdErr)) {
-                Write-Log "FFmpeg exit code was not clean, but output is complete. Continuing."
-                $compressionSucceeded = $true
-            }
-
-            if ($compressionSucceeded) {
-                $newFile = Set-OutputTimestamps -SourcePath $Path -OutputPath $outputFile
-                Write-Log "Compression succeeded. Output size: $($newFile.Length)"
-                Remove-Item -LiteralPath $ffmpegStdOut, $ffmpegStdErr -Force -ErrorAction SilentlyContinue
-                $form.Close()
-            } else {
-                $statusLabel.Text = "Error occurred."
-                [System.Windows.Forms.MessageBox]::Show("FFmpeg failed with exit code $exitCode.`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
+            } catch {
+                Write-Log "FFmpeg launch/compression exception: $($_.Exception.Message)"
+                Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
+                Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
+                $statusLabel.Text = "Error: $($_.Exception.Message)"
+                [System.Windows.Forms.MessageBox]::Show("An error occurred: $($_.Exception.Message)`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
                 & $resetControls
+            } finally {
+                $compressionState.Running = $false
             }
-        } catch {
-            Write-Log "FFmpeg launch/compression exception: $($_.Exception.Message)"
-            Write-LogFileTail -Path $ffmpegStdOut -Label "FFmpeg stdout"
-            Write-LogFileTail -Path $ffmpegStdErr -Label "FFmpeg stderr"
-            $statusLabel.Text = "Error: $($_.Exception.Message)"
-            [System.Windows.Forms.MessageBox]::Show("An error occurred: $($_.Exception.Message)`n`nDebug log:`n$LogFile", "Error", "OK", "Error") | Out-Null
-            & $resetControls
         } finally {
             $compressionState.Running = $false
+            if ($compressBtn.Enabled -eq $false -and -not $form.IsDisposed -and -not $compressionState.Cancelled) {
+                & $resetControls
+            }
         }
     })
 
-    $form.ShowDialog() | Out-Null
+        $form.ShowDialog() | Out-Null
+    } finally {
+        if ($null -ne $form -and -not $form.IsDisposed) {
+            try { $form.Dispose() } catch {}
+        }
+    }
 }
 
 try {
